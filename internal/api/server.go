@@ -630,7 +630,17 @@ func (s *Server) handleRecentDeployments(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) handleDeploymentStream(w http.ResponseWriter, r *http.Request) {
-	claims, ok := getClaims(r)
+	// Allow token via query param since EventSource can't set Authorization header
+	tokenStr := r.URL.Query().Get("token")
+	var claims *auth.Claims
+	var ok bool
+	if tokenStr != "" {
+		var parseErr error
+		claims, parseErr = s.signer.Parse(tokenStr)
+		ok = parseErr == nil && claims != nil
+	} else {
+		claims, ok = getClaims(r)
+	}
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "missing auth claims")
 		return
@@ -660,6 +670,7 @@ func (s *Server) handleDeploymentStream(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "streaming unsupported")
@@ -670,6 +681,8 @@ func (s *Server) handleDeploymentStream(w http.ResponseWriter, r *http.Request) 
 	lastID := int64(0)
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
+
+	terminalStates := map[string]bool{"running": true, "failed": true, "cancelled": true, "superseded": true}
 
 	for {
 		select {
@@ -707,6 +720,16 @@ func (s *Server) handleDeploymentStream(w http.ResponseWriter, r *http.Request) 
 				flusher.Flush()
 			}
 			rows.Close()
+
+			// Check if deployment reached a terminal state
+			var status string
+			if qerr := s.db.QueryRow(ctx, `SELECT status FROM deployments WHERE id = $1`, deploymentID).Scan(&status); qerr == nil {
+				if terminalStates[status] {
+					fmt.Fprintf(w, "event: done\ndata: %s\n\n", marshalJSON(map[string]string{"status": status}))
+					flusher.Flush()
+					return
+				}
+			}
 		}
 	}
 }

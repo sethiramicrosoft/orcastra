@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:3000';
 
@@ -23,17 +23,48 @@ async function api(path, { method = 'GET', token, body } = {}) {
   return json;
 }
 
+function useDeployLogs(token, deploymentID) {
+  const [logs, setLogs] = useState([]);
+  const esRef = useRef(null);
+
+  useEffect(() => {
+    if (!token || !deploymentID) { setLogs([]); return; }
+    setLogs([]);
+    const url = `${API_BASE}/api/v1/deployments/${deploymentID}/stream`;
+    const es = new EventSource(url + `?token=${encodeURIComponent(token)}`);
+    esRef.current = es;
+    es.addEventListener('log', (e) => {
+      try { setLogs((prev) => [...prev, JSON.parse(e.data)]); } catch {}
+    });
+    es.addEventListener('done', () => es.close());
+    es.onerror = () => es.close();
+    return () => es.close();
+  }, [token, deploymentID]);
+
+  return logs;
+}
+
 export default function App() {
   const [token, setToken] = useState(() => localStorage.getItem('orcastra_token') || '');
   const [mode, setMode] = useState('login');
   const [authForm, setAuthForm] = useState(defaultForm);
   const [error, setError] = useState('');
+  const [info, setInfo] = useState('');
   const [dashboard, setDashboard] = useState({ deploymentsToday: 0, queueWaiting: 0, failedBuilds: 0, services: 0 });
   const [deployments, setDeployments] = useState([]);
   const [services, setServices] = useState([]);
   const [serviceForm, setServiceForm] = useState({ name: '', dockerImage: '', gitRepoUrl: '', gitBranch: 'main' });
   const [selectedServiceID, setSelectedServiceID] = useState('');
+  const [watchDeployID, setWatchDeployID] = useState('');
+  const [deploying, setDeploying] = useState(false);
   const [aiConfig, setAIConfig] = useState({ providerType: 'openai_compat', displayName: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1', model: 'openai/gpt-4o-mini', apiKey: '' });
+
+  const logs = useDeployLogs(token, watchDeployID);
+  const logsEndRef = useRef(null);
+
+  useEffect(() => {
+    logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [logs]);
 
   const moodCards = useMemo(
     () => [
@@ -49,6 +80,8 @@ export default function App() {
     if (!token) return;
     localStorage.setItem('orcastra_token', token);
     refresh();
+    const interval = setInterval(refresh, 10000);
+    return () => clearInterval(interval);
   }, [token]);
 
   async function refresh() {
@@ -65,6 +98,14 @@ export default function App() {
     } catch (e) {
       setError(e.message);
     }
+  }
+
+  function logout() {
+    localStorage.removeItem('orcastra_token');
+    setToken('');
+    setDashboard({ deploymentsToday: 0, queueWaiting: 0, failedBuilds: 0, services: 0 });
+    setDeployments([]);
+    setServices([]);
   }
 
   async function handleAuthSubmit(e) {
@@ -84,7 +125,8 @@ export default function App() {
 
   async function ensureLocalhost() {
     try {
-      await api('/api/v1/servers/localhost', { method: 'POST', token });
+      const r = await api('/api/v1/servers/localhost', { method: 'POST', token });
+      setInfo(r.created ? 'Localhost server registered.' : 'Localhost server already exists.');
       setError('');
     } catch (e) {
       setError(e.message);
@@ -93,25 +135,26 @@ export default function App() {
 
   async function createProjectAndService() {
     setError('');
+    setInfo('');
     try {
       const localhost = await api('/api/v1/servers/localhost', { method: 'POST', token });
+      const ts = Date.now();
       const project = await api('/api/v1/projects', {
-        method: 'POST',
-        token,
-        body: { name: 'Default Project', serverId: localhost.id, description: 'Autocreated from UI' }
+        method: 'POST', token,
+        body: { name: `Project-${ts}`, serverId: localhost.id, description: 'Created from UI' }
       });
       await api('/api/v1/services', {
-        method: 'POST',
-        token,
+        method: 'POST', token,
         body: {
           projectId: project.id,
-          name: serviceForm.name || 'my-service',
+          name: serviceForm.name || `service-${ts}`,
           type: 'app',
           dockerImage: serviceForm.dockerImage || 'nginx:alpine',
           gitRepoUrl: serviceForm.gitRepoUrl || '',
           gitBranch: serviceForm.gitBranch || 'main'
         }
       });
+      setInfo('Service created!');
       await refresh();
       setServiceForm({ name: '', dockerImage: '', gitRepoUrl: '', gitBranch: 'main' });
     } catch (e) {
@@ -120,23 +163,25 @@ export default function App() {
   }
 
   async function deployNow() {
-    if (!selectedServiceID) {
-      setError('Select a service first.');
-      return;
-    }
-    setError('');
+    if (!selectedServiceID) { setError('Select a service first.'); return; }
+    setError(''); setInfo(''); setDeploying(true);
     try {
-      await api(`/api/v1/services/${selectedServiceID}/deploy`, { method: 'POST', token, body: {} });
+      const dep = await api(`/api/v1/services/${selectedServiceID}/deploy`, { method: 'POST', token, body: {} });
+      setWatchDeployID(dep.deploymentId);
+      setInfo(`Deploy queued: ${dep.deploymentId.slice(0, 8)}...`);
       await refresh();
     } catch (e) {
       setError(e.message);
+    } finally {
+      setDeploying(false);
     }
   }
 
   async function saveAIConfig() {
-    setError('');
+    setError(''); setInfo('');
     try {
       await api('/api/v1/ai/provider', { method: 'POST', token, body: aiConfig });
+      setInfo('AI provider saved.');
     } catch (e) {
       setError(e.message);
     }
@@ -171,6 +216,8 @@ export default function App() {
     );
   }
 
+  const failedDep = deployments.find((d) => d.status === 'failed');
+
   return (
     <div className="page">
       <div className="aurora aurora-a" />
@@ -185,8 +232,11 @@ export default function App() {
           <p className="subtitle">Not another gray AI dashboard. Bright colors, live signal, and deploy feedback people can actually read.</p>
         </div>
         <div className="hero-actions">
-          <button className="deploy-btn" onClick={deployNow}>Launch deploy</button>
+          <button className={`deploy-btn${deploying ? ' deploying' : ''}`} onClick={deployNow} disabled={deploying}>
+            {deploying ? 'Launching…' : 'Launch deploy'}
+          </button>
           <button className="ghost" onClick={refresh}>Refresh</button>
+          <button className="ghost danger" onClick={logout}>Logout</button>
         </div>
       </header>
 
@@ -199,29 +249,38 @@ export default function App() {
         ))}
       </section>
 
+      {(error || info) && (
+        <div className={`banner ${error ? 'banner-error' : 'banner-info'}`}>
+          {error || info}
+          <button onClick={() => { setError(''); setInfo(''); }}>✕</button>
+        </div>
+      )}
+
       <section className="panels">
         <article className="panel glass">
           <h3>AI failure analysis</h3>
           <div className="ai-bubble">
-            {deployments.find((d) => d.status === 'failed') ? (
+            {failedDep ? (
               <>
-                <p><strong>Likely cause:</strong> {deployments.find((d) => d.status === 'failed').diagnosis || 'No diagnosis yet'}</p>
-                <p><strong>Suggested fix:</strong> {deployments.find((d) => d.status === 'failed').suggestion || 'No suggestion yet'}</p>
+                <p><strong>Likely cause:</strong> {failedDep.diagnosis || 'No diagnosis yet'}</p>
+                <p><strong>Suggested fix:</strong> {failedDep.suggestion || 'No suggestion yet'}</p>
               </>
             ) : (
               <p>No failed deployment yet. Trigger one and Orcastra will analyze it.</p>
             )}
           </div>
-          <div className="actions">
-            <button className="ghost" onClick={saveAIConfig}>Save AI provider</button>
-            <button className="primary">Open fix PR</button>
-          </div>
-          <div className="mini-form">
-            <input placeholder="Provider type" value={aiConfig.providerType} onChange={(e) => setAIConfig({ ...aiConfig, providerType: e.target.value })} />
+          <div className="mini-form" style={{ marginTop: '1rem' }}>
+            <select value={aiConfig.providerType} onChange={(e) => setAIConfig({ ...aiConfig, providerType: e.target.value })}>
+              <option value="openai_compat">OpenAI-compatible (OpenRouter, Groq, Together…)</option>
+              <option value="anthropic">Anthropic (Claude)</option>
+              <option value="gemini">Google Gemini</option>
+              <option value="ollama">Ollama (local)</option>
+            </select>
             <input placeholder="Display name" value={aiConfig.displayName} onChange={(e) => setAIConfig({ ...aiConfig, displayName: e.target.value })} />
             <input placeholder="Base URL" value={aiConfig.baseUrl} onChange={(e) => setAIConfig({ ...aiConfig, baseUrl: e.target.value })} />
             <input placeholder="Model" value={aiConfig.model} onChange={(e) => setAIConfig({ ...aiConfig, model: e.target.value })} />
-            <input placeholder="API key (optional for Ollama)" value={aiConfig.apiKey} onChange={(e) => setAIConfig({ ...aiConfig, apiKey: e.target.value })} />
+            <input placeholder="API key (optional for Ollama)" type="password" value={aiConfig.apiKey} onChange={(e) => setAIConfig({ ...aiConfig, apiKey: e.target.value })} />
+            <button className="ghost" onClick={saveAIConfig}>Save AI provider</button>
           </div>
         </article>
 
@@ -229,17 +288,35 @@ export default function App() {
           <h3>Live timeline</h3>
           <ul className="timeline">
             {deployments.map((item) => (
-              <li key={item.id} className={`tone-${item.status === 'failed' ? 'warning' : item.status === 'running' ? 'success' : 'neutral'}`}>
+              <li
+                key={item.id}
+                className={`tone-${item.status === 'failed' ? 'warning' : item.status === 'running' ? 'success' : 'neutral'} ${watchDeployID === item.id ? 'selected' : ''}`}
+                onClick={() => setWatchDeployID(item.id)}
+                style={{ cursor: 'pointer' }}
+              >
                 <span>{new Date(item.createdAt).toLocaleTimeString()}</span>
                 <div>
-                  <p>{item.serviceName} — {item.status}</p>
+                  <p>{item.serviceName} — <strong>{item.status}</strong></p>
                   <small>{item.commitSha || 'manual trigger'}</small>
                 </div>
               </li>
             ))}
+            {deployments.length === 0 && <li className="tone-neutral"><span>—</span><div><p>No deployments yet</p></div></li>}
           </ul>
         </article>
       </section>
+
+      {watchDeployID && (
+        <section className="panel glass log-panel" style={{ marginTop: '1rem' }}>
+          <h3>Deploy logs <span className="deploy-id">#{watchDeployID.slice(0, 8)}</span></h3>
+          <pre className="log-stream">
+            {logs.length === 0 ? <span className="dim">Waiting for logs…</span> : logs.map((l, i) => (
+              <span key={i} className={l.stream === 'stderr' ? 'log-err' : 'log-out'}>{l.line}{'\n'}</span>
+            ))}
+            <span ref={logsEndRef} />
+          </pre>
+        </section>
+      )}
 
       <section className="panel glass" style={{ marginTop: '1rem' }}>
         <h3>Service setup</h3>
@@ -251,7 +328,7 @@ export default function App() {
           <input placeholder="Docker image (e.g. nginx:alpine)" value={serviceForm.dockerImage} onChange={(e) => setServiceForm({ ...serviceForm, dockerImage: e.target.value })} />
           <input placeholder="Git repo URL (optional)" value={serviceForm.gitRepoUrl} onChange={(e) => setServiceForm({ ...serviceForm, gitRepoUrl: e.target.value })} />
           <input placeholder="Git branch" value={serviceForm.gitBranch} onChange={(e) => setServiceForm({ ...serviceForm, gitBranch: e.target.value })} />
-          <button className="primary" onClick={createProjectAndService}>Create default project + service</button>
+          <button className="primary" onClick={createProjectAndService}>Create project + service</button>
         </div>
         <div className="service-list">
           <label>Deploy target</label>
@@ -262,7 +339,6 @@ export default function App() {
             ))}
           </select>
         </div>
-        {error ? <p className="error">{error}</p> : null}
       </section>
     </div>
   );
