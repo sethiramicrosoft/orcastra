@@ -78,8 +78,10 @@ Bring your own LLM: OpenAI, Anthropic, Gemini, OpenRouter (200+ models), Groq, M
 - [ ] Resource monitoring (CPU, RAM, disk)
 - [x] Multi-user auth (teams, roles, audit log)
 - [x] **AI deploy failure analysis** — diagnosis + suggested fix on every failure
-- [ ] **AI fix PR** — one click to open a pull request with the suggested change
+- [x] **AI fix PR** — one click to open a draft pull request with generated fix context
 - [ ] **AI health monitoring** — plain-English alerts, not just graphs
+
+`GITHUB_TOKEN` is required for fix PR creation. The token must have repository write permissions.
 
 ## API snippets
 
@@ -106,6 +108,15 @@ curl -X POST http://localhost:3000/api/v1/services/<service-id>/domains \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -d '{"fqdn":"app.example.com","sslEnabled":true}'
+```
+
+Open a draft fix PR from a failed deployment:
+
+```bash
+curl -X POST http://localhost:3000/api/v1/deployments/<deployment-id>/fix-pr \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{}'
 ```
 
 ## Architecture principles

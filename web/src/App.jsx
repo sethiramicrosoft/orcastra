@@ -230,6 +230,22 @@ export default function App() {
         setError(e.message);
       }
     }
+
+    async function openFixPR() {
+      const failed = deployments.find((d) => d.status === 'failed');
+      if (!failed) {
+        setError('No failed deployment available.');
+        return;
+      }
+      setError('');
+      setInfo('');
+      try {
+        const out = await api(`/api/v1/deployments/${failed.id}/fix-pr`, { method: 'POST', token, body: {} });
+        setInfo(`Draft PR created: ${out.url}`);
+      } catch (e) {
+        setError(e.message);
+      }
+    }
   }
 
   if (!token) {
@@ -326,6 +342,7 @@ export default function App() {
             <input placeholder="Model" value={aiConfig.model} onChange={(e) => setAIConfig({ ...aiConfig, model: e.target.value })} />
             <input placeholder="API key (optional for Ollama)" type="password" value={aiConfig.apiKey} onChange={(e) => setAIConfig({ ...aiConfig, apiKey: e.target.value })} />
             <button className="ghost" onClick={saveAIConfig}>Save AI provider</button>
+            <button className="primary" onClick={openFixPR}>Open fix PR</button>
           </div>
         </article>
 

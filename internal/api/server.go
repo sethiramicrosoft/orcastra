@@ -19,6 +19,7 @@ import (
 	"github.com/sethiramicrosoft/orcastra/internal/auth"
 	"github.com/sethiramicrosoft/orcastra/internal/caddyadmin"
 	"github.com/sethiramicrosoft/orcastra/internal/deployqueue"
+	"github.com/sethiramicrosoft/orcastra/internal/githubfixpr"
 	"github.com/sethiramicrosoft/orcastra/internal/secretcrypto"
 	"github.com/sethiramicrosoft/orcastra/internal/webhookingest"
 )
@@ -68,6 +69,7 @@ func (s *Server) Routes() http.Handler {
 	r.With(s.requireAuth).Get("/api/v1/dashboard", s.handleDashboard)
 	r.With(s.requireAuth).Get("/api/v1/deployments/recent", s.handleRecentDeployments)
 	r.With(s.requireAuth).Get("/api/v1/deployments/{deploymentID}/stream", s.handleDeploymentStream)
+	r.With(s.requireAuth).Post("/api/v1/deployments/{deploymentID}/fix-pr", s.handleOpenFixPR)
 	r.With(s.requireAuth).Get("/api/v1/services", s.handleListServices)
 	r.With(s.requireAuth).Get("/api/v1/services/{serviceID}/domains", s.handleListServiceDomains)
 	r.With(s.requireAuth).Post("/api/v1/services/{serviceID}/domains", s.handleUpsertServiceDomain)
@@ -96,6 +98,7 @@ func (s *Server) RoutesWithUI(uiHandler http.Handler) http.Handler {
 	r.With(s.requireAuth).Get("/api/v1/dashboard", s.handleDashboard)
 	r.With(s.requireAuth).Get("/api/v1/deployments/recent", s.handleRecentDeployments)
 	r.With(s.requireAuth).Get("/api/v1/deployments/{deploymentID}/stream", s.handleDeploymentStream)
+	r.With(s.requireAuth).Post("/api/v1/deployments/{deploymentID}/fix-pr", s.handleOpenFixPR)
 	r.With(s.requireAuth).Get("/api/v1/services", s.handleListServices)
 	r.With(s.requireAuth).Get("/api/v1/services/{serviceID}/domains", s.handleListServiceDomains)
 	r.With(s.requireAuth).Post("/api/v1/services/{serviceID}/domains", s.handleUpsertServiceDomain)
@@ -691,6 +694,101 @@ func (s *Server) handleRecentDeployments(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) handleOpenFixPR(w http.ResponseWriter, r *http.Request) {
+	claims, ok := getClaims(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "missing auth claims")
+		return
+	}
+	if strings.TrimSpace(s.cfg.GitHubToken) == "" {
+		writeError(w, http.StatusBadRequest, "github token is not configured")
+		return
+	}
+	deploymentID := chi.URLParam(r, "deploymentID")
+	if strings.TrimSpace(deploymentID) == "" {
+		writeError(w, http.StatusBadRequest, "deploymentID is required")
+		return
+	}
+
+	var (
+		status      string
+		diagnosis   string
+		suggestion  string
+		commitSHA   string
+		serviceName string
+		gitRepoURL  string
+	)
+	err := s.db.QueryRow(r.Context(), `
+		SELECT d.status::text,
+		       COALESCE(d.ai_diagnosis, ''),
+		       COALESCE(d.ai_suggestion, ''),
+		       COALESCE(d.commit_sha, ''),
+		       COALESCE(s.name, ''),
+		       COALESCE(s.git_repo_url, '')
+		FROM deployments d
+		JOIN services s ON s.id = d.service_id
+		WHERE d.id = $1::uuid
+		  AND d.team_id = $2::uuid
+		  AND s.deleted_at IS NULL
+	`, deploymentID, claims.TeamID).Scan(&status, &diagnosis, &suggestion, &commitSHA, &serviceName, &gitRepoURL)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "deployment not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load deployment")
+		return
+	}
+	if status != "failed" {
+		writeError(w, http.StatusBadRequest, "only failed deployments can open fix PR")
+		return
+	}
+	if strings.TrimSpace(suggestion) == "" {
+		writeError(w, http.StatusBadRequest, "deployment has no ai suggestion")
+		return
+	}
+	repo := webhookingest.NormalizeRepo(gitRepoURL)
+	if strings.TrimSpace(repo) == "" || !strings.Contains(repo, "/") {
+		writeError(w, http.StatusBadRequest, "service gitRepoUrl is required to open fix PR")
+		return
+	}
+
+	gh, err := githubfixpr.New(s.cfg.GitHubToken)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to initialize github client")
+		return
+	}
+	out, err := gh.CreateFixPR(r.Context(), githubfixpr.CreateFixPRInput{
+		Repo:        repo,
+		Deployment:  deploymentID,
+		CommitSHA:   commitSHA,
+		Diagnosis:   diagnosis,
+		Suggestion:  suggestion,
+		ServiceName: serviceName,
+	})
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "failed to create fix pr")
+		return
+	}
+
+	_, _ = s.db.Exec(r.Context(), `
+		INSERT INTO audit_events (actor_id, action, resource_type, resource_id, team_id, meta)
+		VALUES ($1::uuid, 'deployment.fix_pr.open', 'deployment', $2::uuid, $3::uuid,
+		        jsonb_build_object('repo', $4::text, 'pr_url', $5::text, 'pr_number', $6))
+	`, claims.UserID, deploymentID, claims.TeamID, out.Repo, out.URL, out.Number)
+
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"url":        out.URL,
+		"number":     out.Number,
+		"repo":       out.Repo,
+		"branch":     out.Branch,
+		"base":       out.BaseBranch,
+		"draft":      true,
+		"status":     "created",
+		"deployment": deploymentID,
+	})
 }
 
 func (s *Server) handleDeploymentStream(w http.ResponseWriter, r *http.Request) {
