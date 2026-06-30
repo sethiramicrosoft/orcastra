@@ -70,7 +70,7 @@ Bring your own LLM: OpenAI, Anthropic, Gemini, OpenRouter (200+ models), Groq, M
 
 - [ ] SSH server onboarding (keypair-based, Orcastra generates the keypair)
 - [ ] Docker container orchestration (apps, databases, workers)
-- [ ] Caddy reverse proxy with automatic Let's Encrypt SSL
+- [x] Caddy reverse proxy route automation via Caddy Admin API
 - [ ] Git webhook auto-deploy (GitHub, GitLab, Bitbucket)
 - [x] Real-time deploy logs (SSE, structured + stored for AI)
 - [x] Service secret management (versioned env vars per service)
@@ -97,6 +97,15 @@ List current secret keys for a service:
 ```bash
 curl http://localhost:3000/api/v1/services/<service-id>/secrets \
   -H "Authorization: Bearer <token>"
+```
+
+Upsert a domain route for a service (writes DB + configures Caddy):
+
+```bash
+curl -X POST http://localhost:3000/api/v1/services/<service-id>/domains \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"fqdn":"app.example.com","sslEnabled":true}'
 ```
 
 ## Architecture principles

@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/sethiramicrosoft/orcastra/internal/auth"
+	"github.com/sethiramicrosoft/orcastra/internal/caddyadmin"
 	"github.com/sethiramicrosoft/orcastra/internal/deployqueue"
 	"github.com/sethiramicrosoft/orcastra/internal/secretcrypto"
 	"github.com/sethiramicrosoft/orcastra/internal/webhookingest"
@@ -28,6 +29,7 @@ type Server struct {
 	signer    *auth.JWTSigner
 	queue     *deployqueue.Queue
 	secCipher *secretcrypto.Cipher
+	caddy     *caddyadmin.Client
 }
 
 func NewServer(cfg Config, db *pgxpool.Pool) (*Server, error) {
@@ -39,12 +41,20 @@ func NewServer(cfg Config, db *pgxpool.Pool) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("configure secret crypto: %w", err)
 	}
+	var caddyClient *caddyadmin.Client
+	if strings.TrimSpace(cfg.CaddyAdminAPI) != "" {
+		caddyClient, err = caddyadmin.New(cfg.CaddyAdminAPI)
+		if err != nil {
+			return nil, fmt.Errorf("configure caddy admin client: %w", err)
+		}
+	}
 	return &Server{
 		cfg:       cfg,
 		db:        db,
 		signer:    signer,
 		queue:     deployqueue.New(db, secCipher),
 		secCipher: secCipher,
+		caddy:     caddyClient,
 	}, nil
 }
 
@@ -59,6 +69,9 @@ func (s *Server) Routes() http.Handler {
 	r.With(s.requireAuth).Get("/api/v1/deployments/recent", s.handleRecentDeployments)
 	r.With(s.requireAuth).Get("/api/v1/deployments/{deploymentID}/stream", s.handleDeploymentStream)
 	r.With(s.requireAuth).Get("/api/v1/services", s.handleListServices)
+	r.With(s.requireAuth).Get("/api/v1/services/{serviceID}/domains", s.handleListServiceDomains)
+	r.With(s.requireAuth).Post("/api/v1/services/{serviceID}/domains", s.handleUpsertServiceDomain)
+	r.With(s.requireAuth).Delete("/api/v1/services/{serviceID}/domains/{domainID}", s.handleDeleteServiceDomain)
 	r.With(s.requireAuth).Get("/api/v1/services/{serviceID}/secrets", s.handleListServiceSecrets)
 	r.With(s.requireAuth).Post("/api/v1/services/{serviceID}/secrets", s.handleUpsertServiceSecret)
 	r.With(s.requireAuth).Post("/api/v1/servers/localhost", s.handleEnsureLocalhostServer)
@@ -84,6 +97,9 @@ func (s *Server) RoutesWithUI(uiHandler http.Handler) http.Handler {
 	r.With(s.requireAuth).Get("/api/v1/deployments/recent", s.handleRecentDeployments)
 	r.With(s.requireAuth).Get("/api/v1/deployments/{deploymentID}/stream", s.handleDeploymentStream)
 	r.With(s.requireAuth).Get("/api/v1/services", s.handleListServices)
+	r.With(s.requireAuth).Get("/api/v1/services/{serviceID}/domains", s.handleListServiceDomains)
+	r.With(s.requireAuth).Post("/api/v1/services/{serviceID}/domains", s.handleUpsertServiceDomain)
+	r.With(s.requireAuth).Delete("/api/v1/services/{serviceID}/domains/{domainID}", s.handleDeleteServiceDomain)
 	r.With(s.requireAuth).Get("/api/v1/services/{serviceID}/secrets", s.handleListServiceSecrets)
 	r.With(s.requireAuth).Post("/api/v1/services/{serviceID}/secrets", s.handleUpsertServiceSecret)
 	r.With(s.requireAuth).Post("/api/v1/servers/localhost", s.handleEnsureLocalhostServer)
@@ -893,6 +909,213 @@ func (s *Server) handleListServiceSecrets(w http.ResponseWriter, r *http.Request
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) handleListServiceDomains(w http.ResponseWriter, r *http.Request) {
+	claims, ok := getClaims(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "missing auth claims")
+		return
+	}
+	serviceID := chi.URLParam(r, "serviceID")
+	if strings.TrimSpace(serviceID) == "" {
+		writeError(w, http.StatusBadRequest, "serviceID is required")
+		return
+	}
+
+	rows, err := s.db.Query(r.Context(), `
+		SELECT d.id, d.fqdn, d.ssl_enabled, COALESCE(d.ssl_status, ''), d.created_at
+		FROM domains d
+		JOIN services s ON s.id = d.service_id
+		WHERE d.service_id = $1::uuid
+		  AND d.team_id = $2::uuid
+		  AND s.deleted_at IS NULL
+		ORDER BY d.created_at DESC
+	`, serviceID, claims.TeamID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list domains")
+		return
+	}
+	defer rows.Close()
+
+	type domainItem struct {
+		ID         string `json:"id"`
+		FQDN       string `json:"fqdn"`
+		SSLEnabled bool   `json:"sslEnabled"`
+		SSLStatus  string `json:"sslStatus,omitempty"`
+		CreatedAt  string `json:"createdAt"`
+	}
+	items := make([]domainItem, 0)
+	for rows.Next() {
+		var item domainItem
+		var created time.Time
+		if scanErr := rows.Scan(&item.ID, &item.FQDN, &item.SSLEnabled, &item.SSLStatus, &created); scanErr != nil {
+			writeError(w, http.StatusInternalServerError, "failed to parse domains")
+			return
+		}
+		item.CreatedAt = created.UTC().Format(time.RFC3339)
+		items = append(items, item)
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		writeError(w, http.StatusInternalServerError, "failed to iterate domains")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) handleUpsertServiceDomain(w http.ResponseWriter, r *http.Request) {
+	claims, ok := getClaims(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "missing auth claims")
+		return
+	}
+	if s.caddy == nil {
+		writeError(w, http.StatusBadRequest, "caddy admin api is not configured")
+		return
+	}
+	serviceID := chi.URLParam(r, "serviceID")
+	if strings.TrimSpace(serviceID) == "" {
+		writeError(w, http.StatusBadRequest, "serviceID is required")
+		return
+	}
+
+	var req struct {
+		FQDN       string `json:"fqdn"`
+		SSLEnabled *bool  `json:"sslEnabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	fqdn := strings.ToLower(strings.TrimSpace(req.FQDN))
+	if fqdn == "" {
+		writeError(w, http.StatusBadRequest, "fqdn is required")
+		return
+	}
+
+	var (
+		servicePort int
+		dockerImage string
+	)
+	err := s.db.QueryRow(r.Context(), `
+		SELECT COALESCE(port, 0), COALESCE(docker_image, '')
+		FROM services
+		WHERE id = $1::uuid AND team_id = $2::uuid AND deleted_at IS NULL
+	`, serviceID, claims.TeamID).Scan(&servicePort, &dockerImage)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "service not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load service")
+		return
+	}
+	if servicePort <= 0 {
+		writeError(w, http.StatusBadRequest, "service port is required for domain routing")
+		return
+	}
+	if dockerImage == "" {
+		writeError(w, http.StatusBadRequest, "service dockerImage is required for domain routing")
+		return
+	}
+
+	sslEnabled := true
+	if req.SSLEnabled != nil {
+		sslEnabled = *req.SSLEnabled
+	}
+
+	upstream := fmt.Sprintf("host.docker.internal:%d", servicePort)
+	if err := s.caddy.UpsertDomainRoute(r.Context(), fqdn, upstream); err != nil {
+		writeError(w, http.StatusBadGateway, "failed to configure caddy route")
+		return
+	}
+
+	domainID := uuid.NewString()
+	_, err = s.db.Exec(r.Context(), `
+		INSERT INTO domains (id, service_id, team_id, fqdn, ssl_enabled, ssl_status, updated_at)
+		VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, now())
+		ON CONFLICT (fqdn)
+		DO UPDATE SET service_id = EXCLUDED.service_id,
+		              team_id = EXCLUDED.team_id,
+		              ssl_enabled = EXCLUDED.ssl_enabled,
+		              ssl_status = EXCLUDED.ssl_status,
+		              updated_at = now()
+	`, domainID, serviceID, claims.TeamID, fqdn, sslEnabled, "configured")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to persist domain")
+		return
+	}
+
+	_, _ = s.db.Exec(r.Context(), `
+		UPDATE services
+		SET domain = $2, updated_at = now()
+		WHERE id = $1::uuid AND team_id = $3::uuid
+	`, serviceID, fqdn, claims.TeamID)
+
+	_, _ = s.db.Exec(r.Context(), `
+		INSERT INTO audit_events (actor_id, action, resource_type, resource_id, team_id, meta)
+		VALUES ($1::uuid, 'domain.upsert', 'service', $2::uuid, $3::uuid, jsonb_build_object('fqdn', $4::text, 'upstream', $5::text))
+	`, claims.UserID, serviceID, claims.TeamID, fqdn, upstream)
+
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"fqdn":      fqdn,
+		"upstream":  upstream,
+		"sslStatus": "configured",
+	})
+}
+
+func (s *Server) handleDeleteServiceDomain(w http.ResponseWriter, r *http.Request) {
+	claims, ok := getClaims(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "missing auth claims")
+		return
+	}
+	if s.caddy == nil {
+		writeError(w, http.StatusBadRequest, "caddy admin api is not configured")
+		return
+	}
+	serviceID := chi.URLParam(r, "serviceID")
+	domainID := chi.URLParam(r, "domainID")
+	if strings.TrimSpace(serviceID) == "" || strings.TrimSpace(domainID) == "" {
+		writeError(w, http.StatusBadRequest, "serviceID and domainID are required")
+		return
+	}
+
+	var fqdn string
+	err := s.db.QueryRow(r.Context(), `
+		SELECT fqdn
+		FROM domains
+		WHERE id = $1::uuid AND service_id = $2::uuid AND team_id = $3::uuid
+	`, domainID, serviceID, claims.TeamID).Scan(&fqdn)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "domain not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load domain")
+		return
+	}
+
+	if err := s.caddy.DeleteDomainRoute(r.Context(), fqdn); err != nil {
+		writeError(w, http.StatusBadGateway, "failed to remove caddy route")
+		return
+	}
+
+	_, err = s.db.Exec(r.Context(), `
+		DELETE FROM domains
+		WHERE id = $1::uuid AND service_id = $2::uuid AND team_id = $3::uuid
+	`, domainID, serviceID, claims.TeamID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to delete domain")
+		return
+	}
+
+	_, _ = s.db.Exec(r.Context(), `
+		INSERT INTO audit_events (actor_id, action, resource_type, resource_id, team_id, meta)
+		VALUES ($1::uuid, 'domain.delete', 'service', $2::uuid, $3::uuid, jsonb_build_object('fqdn', $4::text))
+	`, claims.UserID, serviceID, claims.TeamID, fqdn)
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
 func (s *Server) handleUpsertServiceSecret(w http.ResponseWriter, r *http.Request) {

@@ -20,6 +20,7 @@ type Config struct {
 	GitHubWebhookSecret string
 	EncryptionKeyB64    string
 	EncryptionKeyID     string
+	CaddyAdminAPI       string
 }
 
 func LoadConfigFromEnv() (Config, error) {
@@ -34,6 +35,7 @@ func LoadConfigFromEnv() (Config, error) {
 		GitHubWebhookSecret: os.Getenv("GITHUB_WEBHOOK_SECRET"),
 		EncryptionKeyB64:    strings.TrimSpace(os.Getenv("ENCRYPTION_KEY_B64")),
 		EncryptionKeyID:     getenv("ENCRYPTION_KEY_ID", "aesgcm-v1"),
+		CaddyAdminAPI:       strings.TrimSpace(os.Getenv("CADDY_ADMIN_API")),
 	}
 
 	if cfg.DatabaseURL == "" {

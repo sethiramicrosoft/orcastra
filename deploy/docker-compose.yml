@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   orcastra:
     build:
@@ -46,6 +44,7 @@ services:
 
   caddy:
     image: caddy:2-alpine
+    command: ["caddy", "run", "--config", "/etc/caddy/caddy.json"]
     restart: unless-stopped
     ports:
       - "80:80"
@@ -54,6 +53,7 @@ services:
     volumes:
       - caddy_data:/data
       - caddy_config:/config
+      - ./caddy.bootstrap.json:/etc/caddy/caddy.json:ro
     networks:
       - orcastra_net
 

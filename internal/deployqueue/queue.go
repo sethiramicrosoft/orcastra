@@ -52,6 +52,7 @@ type Job struct {
 	DockerImage  string
 	GitRepoURL   string
 	GitBranch    string
+	ServicePort  int
 	IsLocalhost  bool
 	SSHHost      string
 	SSHPort      int
@@ -126,6 +127,7 @@ func (q *Queue) ClaimNext(ctx context.Context) (*Job, error) {
 			       COALESCE(s.docker_image, '') AS docker_image,
 			       COALESCE(s.git_repo_url, '') AS git_repo_url,
 			       COALESCE(s.git_branch, 'main') AS git_branch,
+			       COALESCE(s.port, 0) AS service_port,
 			       srv.is_localhost,
 			       COALESCE(srv.host, '') AS ssh_host,
 			       COALESCE(srv.port, 22) AS ssh_port,
@@ -146,7 +148,7 @@ func (q *Queue) ClaimNext(ctx context.Context) (*Job, error) {
 		SET status = 'building', started_at = now()
 		FROM next_job
 		WHERE d.id = next_job.id
-		RETURNING next_job.id, next_job.service_id, next_job.team_id, next_job.service_name, next_job.trigger_type, next_job.commit_sha, next_job.docker_image, next_job.git_repo_url, next_job.git_branch, next_job.is_localhost, next_job.ssh_host, next_job.ssh_port, next_job.ssh_user, next_job.ssh_key_ct, next_job.ssh_key_kid, next_job.ssh_host_fingerprint
+		RETURNING next_job.id, next_job.service_id, next_job.team_id, next_job.service_name, next_job.trigger_type, next_job.commit_sha, next_job.docker_image, next_job.git_repo_url, next_job.git_branch, next_job.service_port, next_job.is_localhost, next_job.ssh_host, next_job.ssh_port, next_job.ssh_user, next_job.ssh_key_ct, next_job.ssh_key_kid, next_job.ssh_host_fingerprint
 	`).Scan(
 		&job.DeploymentID,
 		&job.ServiceID,
@@ -157,6 +159,7 @@ func (q *Queue) ClaimNext(ctx context.Context) (*Job, error) {
 		&job.DockerImage,
 		&job.GitRepoURL,
 		&job.GitBranch,
+		&job.ServicePort,
 		&job.IsLocalhost,
 		&job.SSHHost,
 		&job.SSHPort,

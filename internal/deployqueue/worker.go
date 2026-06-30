@@ -92,10 +92,19 @@ func (w *Worker) processOnce(ctx context.Context) error {
 	}
 
 	containerName := fmt.Sprintf("orcastra-%s-%s", short(job.ServiceID), short(job.DeploymentID))
+	portBindings := make([]hostdriver.PortBinding, 0, 1)
+	if job.ServicePort > 0 {
+		portBindings = append(portBindings, hostdriver.PortBinding{
+			HostPort:      job.ServicePort,
+			ContainerPort: job.ServicePort,
+			Protocol:      "tcp",
+		})
+	}
 	containerID, err := driver.RunContainer(ctx, hostdriver.ContainerSpec{
 		Name:  containerName,
 		Image: job.DockerImage,
 		Env:   envVars,
+		Ports: portBindings,
 		Labels: map[string]string{
 			"orcastra.service_id":    job.ServiceID,
 			"orcastra.deployment_id": job.DeploymentID,
