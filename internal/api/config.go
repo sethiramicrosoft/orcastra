@@ -9,12 +9,14 @@ import (
 )
 
 type Config struct {
-	Host       string
-	Port       int
+	Host        string
+	Port        int
 	DatabaseURL string
-	JWTSecret  string
-	JWTIssuer  string
-	JWTTTL     time.Duration
+	JWTSecret   string
+	JWTIssuer   string
+	JWTTTL      time.Duration
+
+	GitHubWebhookSecret string
 }
 
 func LoadConfigFromEnv() (Config, error) {
@@ -25,6 +27,8 @@ func LoadConfigFromEnv() (Config, error) {
 		JWTSecret:   os.Getenv("JWT_SECRET"),
 		JWTIssuer:   getenv("JWT_ISSUER", "orcastra"),
 		JWTTTL:      getenvDuration("JWT_TTL", 24*time.Hour),
+
+		GitHubWebhookSecret: os.Getenv("GITHUB_WEBHOOK_SECRET"),
 	}
 
 	if cfg.DatabaseURL == "" {

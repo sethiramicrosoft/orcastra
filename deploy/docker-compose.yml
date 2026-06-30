@@ -12,6 +12,7 @@ services:
     environment:
       - DATABASE_URL=postgres://orcastra:${POSTGRES_PASSWORD}@postgres:5432/orcastra?sslmode=disable
       - JWT_SECRET=${JWT_SECRET}
+      - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET}
       - CADDY_ADMIN_API=http://caddy:2019
     depends_on:
       postgres:

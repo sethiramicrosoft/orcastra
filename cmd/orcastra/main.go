@@ -29,7 +29,10 @@ func main() {
 	}
 	defer pool.Close()
 
-	server := api.NewServer(cfg, pool)
+	server, err := api.NewServer(cfg, pool)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to initialize API server")
+	}
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddress(),
 		Handler:           server.Routes(),
