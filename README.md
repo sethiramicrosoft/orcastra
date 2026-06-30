@@ -82,6 +82,8 @@ Bring your own LLM: OpenAI, Anthropic, Gemini, OpenRouter (200+ models), Groq, M
 - [x] **AI fix PR** — one click to open a draft pull request with generated fix context
 - [x] **AI health monitoring** — periodic running-container checks with alert/audit events
 
+Remote SSH deploys require host fingerprint pinning; insecure host-key fallback is disabled.
+
 `GITHUB_TOKEN` is required for fix PR creation. The token must have repository write permissions.
 
 ## API snippets

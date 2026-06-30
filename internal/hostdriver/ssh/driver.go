@@ -284,7 +284,9 @@ func (d *Driver) dial(_ context.Context) (*gossh.Client, error) {
 
 func (d *Driver) hostKeyCallback() gossh.HostKeyCallback {
 	if strings.TrimSpace(d.cfg.Fingerprint) == "" {
-		return gossh.InsecureIgnoreHostKey()
+		return func(_ string, _ net.Addr, _ gossh.PublicKey) error {
+			return fmt.Errorf("ssh host fingerprint is required")
+		}
 	}
 	return func(_ string, _ net.Addr, key gossh.PublicKey) error {
 		fp := gossh.FingerprintSHA256(key)
