@@ -43,11 +43,14 @@ func NewServer(cfg Config, db *pgxpool.Pool) (*Server, error) {
 func (s *Server) Routes() http.Handler {
 	r := chi.NewRouter()
 	r.Get("/healthz", s.handleHealthz)
+
 	r.Post("/api/v1/auth/register", s.handleRegister)
 	r.Post("/api/v1/auth/login", s.handleLogin)
 	r.With(s.requireAuth).Get("/api/v1/auth/me", s.handleMe)
+
 	r.With(s.requireAuth).Post("/api/v1/services/{serviceID}/deploy", s.handleManualDeploy)
 	r.Post("/api/v1/webhooks/github", s.handleGitHubWebhook)
+
 	return r
 }
 
@@ -60,6 +63,11 @@ type registerRequest struct {
 	Password    string `json:"password"`
 	DisplayName string `json:"displayName"`
 	TeamName    string `json:"teamName"`
+}
+
+type loginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
 }
 
 type authResponse struct {
@@ -122,7 +130,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	_, err = tx.Exec(ctx, `
 		INSERT INTO users (id, email, password_hash, display_name, is_root_admin)
 		VALUES ($1, $2, $3, $4, false)
-	`, userID, req.Email, passwordHash, nullableString(req.DisplayName))
+	`, userID, strings.ToLower(strings.TrimSpace(req.Email)), passwordHash, nullableString(req.DisplayName))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create user")
 		return
@@ -149,7 +157,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	_, err = tx.Exec(ctx, `
 		INSERT INTO audit_events (actor_id, action, resource_type, resource_id, team_id, meta)
 		VALUES ($1, 'auth.register', 'user', $1, $2, jsonb_build_object('email', $3))
-	`, userID, teamID, req.Email)
+	`, userID, teamID, strings.ToLower(strings.TrimSpace(req.Email)))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to write audit event")
 		return
@@ -177,11 +185,6 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, resp)
 }
 
-type loginRequest struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
-}
-
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var req loginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -195,13 +198,13 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	var (
-		userID      string
-		email       string
-		displayName string
+		userID       string
+		email        string
+		displayName  string
 		passwordHash string
-		teamID      string
-		teamName    string
-		teamRole    string
+		teamID       string
+		teamName     string
+		teamRole     string
 	)
 	err := s.db.QueryRow(ctx, `
 		SELECT u.id, u.email, COALESCE(u.display_name, ''), u.password_hash,
@@ -293,194 +296,6 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	type manualDeployResponse struct {
-		DeploymentID string `json:"deploymentId"`
-		Status       string `json:"status"`
-		CommitSHA    string `json:"commitSha,omitempty"`
-	}
-
-	func (s *Server) handleManualDeploy(w http.ResponseWriter, r *http.Request) {
-		claims, ok := r.Context().Value(claimsContextKey).(*auth.Claims)
-		if !ok || claims == nil {
-			writeError(w, http.StatusUnauthorized, "missing auth claims")
-			return
-		}
-		serviceID := chi.URLParam(r, "serviceID")
-		if serviceID == "" {
-			writeError(w, http.StatusBadRequest, "serviceID is required")
-			return
-		}
-
-		var req struct {
-			CommitSHA     string `json:"commitSha"`
-			CommitMessage string `json:"commitMessage"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-			writeError(w, http.StatusBadRequest, "invalid JSON body")
-			return
-		}
-
-		allowed, err := s.userCanDeployToService(r.Context(), claims.UserID, claims.TeamID, serviceID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to validate service access")
-			return
-		}
-		if !allowed {
-			writeError(w, http.StatusForbidden, "service not found or not in your team")
-			return
-		}
-
-		userID := claims.UserID
-		dep, err := s.queue.Enqueue(r.Context(), deployqueue.EnqueueInput{
-			ServiceID:       serviceID,
-			TeamID:          claims.TeamID,
-			TriggerType:     "manual",
-			CommitSHA:       strings.TrimSpace(req.CommitSHA),
-			CommitMessage:   strings.TrimSpace(req.CommitMessage),
-			TriggeredByUser: &userID,
-		})
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to enqueue deployment")
-			return
-		}
-
-		_, err = s.db.Exec(r.Context(), `
-			INSERT INTO audit_events (actor_id, action, resource_type, resource_id, team_id, meta)
-			VALUES ($1, 'service.deploy.manual', 'deployment', $2, $3, jsonb_build_object('serviceId', $4, 'commitSha', $5))
-		`, claims.UserID, dep.ID, claims.TeamID, serviceID, nullable(req.CommitSHA))
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to write audit event")
-			return
-		}
-
-		writeJSON(w, http.StatusAccepted, manualDeployResponse{
-			DeploymentID: dep.ID,
-			Status:       dep.Status,
-			CommitSHA:    dep.CommitSHA,
-		})
-	}
-
-	func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
-		if s.cfg.GitHubWebhookSecret == "" {
-			writeError(w, http.StatusServiceUnavailable, "github webhook secret not configured")
-			return
-		}
-		eventType := r.Header.Get("X-GitHub-Event")
-		if eventType != "push" {
-			writeJSON(w, http.StatusOK, map[string]string{"status": "ignored"})
-			return
-		}
-
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "failed to read payload")
-			return
-		}
-
-		signature := r.Header.Get("X-Hub-Signature-256")
-		if !webhookingest.VerifyGitHubSignature(s.cfg.GitHubWebhookSecret, body, signature) {
-			writeError(w, http.StatusUnauthorized, "invalid github signature")
-			return
-		}
-
-		pushEvent, err := webhookingest.ParseGitHubPushEvent(body)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-
-		branch := webhookingest.BranchFromRef(pushEvent.Ref)
-		repoCandidates := []string{
-			webhookingest.NormalizeRepo(pushEvent.Repository.FullName),
-			webhookingest.NormalizeRepo(pushEvent.Repository.CloneURL),
-			webhookingest.NormalizeRepo(pushEvent.Repository.HTMLURL),
-			webhookingest.NormalizeRepo(pushEvent.Repository.SSHURL),
-		}
-
-		type serviceRow struct {
-			ID      string
-			TeamID  string
-			RepoURL string
-			Branch  string
-		}
-
-		rows, err := s.db.Query(r.Context(), `
-			SELECT id, team_id, COALESCE(git_repo_url, ''), COALESCE(git_branch, 'main')
-			FROM services
-			WHERE deleted_at IS NULL AND git_repo_url IS NOT NULL
-		`)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to load services")
-			return
-		}
-		defer rows.Close()
-
-		enqueued := 0
-		for rows.Next() {
-			var svc serviceRow
-			if err := rows.Scan(&svc.ID, &svc.TeamID, &svc.RepoURL, &svc.Branch); err != nil {
-				writeError(w, http.StatusInternalServerError, "failed to read services")
-				return
-			}
-			if !matchesRepo(repoCandidates, webhookingest.NormalizeRepo(svc.RepoURL)) {
-				continue
-			}
-			if strings.TrimSpace(svc.Branch) != branch {
-				continue
-			}
-
-			_, err := s.queue.Enqueue(r.Context(), deployqueue.EnqueueInput{
-				ServiceID:      svc.ID,
-				TeamID:         svc.TeamID,
-				TriggerType:    "webhook",
-				CommitSHA:      strings.TrimSpace(pushEvent.After),
-				CommitMessage:  strings.TrimSpace(pushEvent.HeadCommit.Message),
-				TriggeredByUser: nil,
-			})
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, "failed to enqueue webhook deployment")
-				return
-			}
-			enqueued++
-		}
-		if err := rows.Err(); err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to iterate services")
-			return
-		}
-
-		writeJSON(w, http.StatusAccepted, map[string]any{
-			"status":   "accepted",
-			"enqueued": enqueued,
-			"branch":   branch,
-			"repo":     pushEvent.Repository.FullName,
-		})
-	}
-
-	func (s *Server) userCanDeployToService(ctx context.Context, userID, teamID, serviceID string) (bool, error) {
-		var exists bool
-		err := s.db.QueryRow(ctx, `
-			SELECT EXISTS(
-				SELECT 1
-				FROM services s
-				JOIN team_members tm ON tm.team_id = s.team_id
-				WHERE s.id = $1 AND s.team_id = $2 AND tm.user_id = $3 AND s.deleted_at IS NULL
-			)
-		`, serviceID, teamID, userID).Scan(&exists)
-		if err != nil {
-			return false, err
-		}
-		return exists, nil
-	}
-
-	func matchesRepo(candidates []string, serviceRepo string) bool {
-		for _, c := range candidates {
-			if c != "" && c == serviceRepo {
-				return true
-			}
-		}
-		return false
-	}
-
 	var (
 		email       string
 		displayName string
@@ -517,6 +332,184 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type manualDeployResponse struct {
+	DeploymentID string `json:"deploymentId"`
+	Status       string `json:"status"`
+	CommitSHA    string `json:"commitSha,omitempty"`
+}
+
+func (s *Server) handleManualDeploy(w http.ResponseWriter, r *http.Request) {
+	claims, ok := r.Context().Value(claimsContextKey).(*auth.Claims)
+	if !ok || claims == nil {
+		writeError(w, http.StatusUnauthorized, "missing auth claims")
+		return
+	}
+	serviceID := chi.URLParam(r, "serviceID")
+	if serviceID == "" {
+		writeError(w, http.StatusBadRequest, "serviceID is required")
+		return
+	}
+
+	var req struct {
+		CommitSHA     string `json:"commitSha"`
+		CommitMessage string `json:"commitMessage"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	allowed, err := s.userCanDeployToService(r.Context(), claims.UserID, claims.TeamID, serviceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to validate service access")
+		return
+	}
+	if !allowed {
+		writeError(w, http.StatusForbidden, "service not found or not in your team")
+		return
+	}
+
+	userID := claims.UserID
+	dep, err := s.queue.Enqueue(r.Context(), deployqueue.EnqueueInput{
+		ServiceID:       serviceID,
+		TeamID:          claims.TeamID,
+		TriggerType:     "manual",
+		CommitSHA:       strings.TrimSpace(req.CommitSHA),
+		CommitMessage:   strings.TrimSpace(req.CommitMessage),
+		TriggeredByUser: &userID,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to enqueue deployment")
+		return
+	}
+
+	_, err = s.db.Exec(r.Context(), `
+		INSERT INTO audit_events (actor_id, action, resource_type, resource_id, team_id, meta)
+		VALUES ($1, 'service.deploy.manual', 'deployment', $2, $3, jsonb_build_object('serviceId', $4, 'commitSha', $5))
+	`, claims.UserID, dep.ID, claims.TeamID, serviceID, nullableString(req.CommitSHA))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to write audit event")
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, manualDeployResponse{
+		DeploymentID: dep.ID,
+		Status:       dep.Status,
+		CommitSHA:    dep.CommitSHA,
+	})
+}
+
+func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.GitHubWebhookSecret == "" {
+		writeError(w, http.StatusServiceUnavailable, "github webhook secret not configured")
+		return
+	}
+	if r.Header.Get("X-GitHub-Event") != "push" {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ignored"})
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read payload")
+		return
+	}
+
+	signature := r.Header.Get("X-Hub-Signature-256")
+	if !webhookingest.VerifyGitHubSignature(s.cfg.GitHubWebhookSecret, body, signature) {
+		writeError(w, http.StatusUnauthorized, "invalid github signature")
+		return
+	}
+
+	pushEvent, err := webhookingest.ParseGitHubPushEvent(body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	branch := webhookingest.BranchFromRef(pushEvent.Ref)
+	repoCandidates := []string{
+		webhookingest.NormalizeRepo(pushEvent.Repository.FullName),
+		webhookingest.NormalizeRepo(pushEvent.Repository.CloneURL),
+		webhookingest.NormalizeRepo(pushEvent.Repository.HTMLURL),
+		webhookingest.NormalizeRepo(pushEvent.Repository.SSHURL),
+	}
+
+	type serviceRow struct {
+		ID      string
+		TeamID  string
+		RepoURL string
+		Branch  string
+	}
+
+	rows, err := s.db.Query(r.Context(), `
+		SELECT id, team_id, COALESCE(git_repo_url, ''), COALESCE(git_branch, 'main')
+		FROM services
+		WHERE deleted_at IS NULL AND git_repo_url IS NOT NULL
+	`)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load services")
+		return
+	}
+	defer rows.Close()
+
+	enqueued := 0
+	for rows.Next() {
+		var svc serviceRow
+		if err := rows.Scan(&svc.ID, &svc.TeamID, &svc.RepoURL, &svc.Branch); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to read services")
+			return
+		}
+		if !matchesRepo(repoCandidates, webhookingest.NormalizeRepo(svc.RepoURL)) {
+			continue
+		}
+		if strings.TrimSpace(svc.Branch) != branch {
+			continue
+		}
+
+		_, err := s.queue.Enqueue(r.Context(), deployqueue.EnqueueInput{
+			ServiceID:       svc.ID,
+			TeamID:          svc.TeamID,
+			TriggerType:     "webhook",
+			CommitSHA:       strings.TrimSpace(pushEvent.After),
+			CommitMessage:   strings.TrimSpace(pushEvent.HeadCommit.Message),
+			TriggeredByUser: nil,
+		})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to enqueue webhook deployment")
+			return
+		}
+		enqueued++
+	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to iterate services")
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"status":   "accepted",
+		"enqueued": enqueued,
+		"branch":   branch,
+		"repo":     pushEvent.Repository.FullName,
+	})
+}
+
+func (s *Server) userCanDeployToService(ctx context.Context, userID, teamID, serviceID string) (bool, error) {
+	var exists bool
+	err := s.db.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1
+			FROM services s
+			JOIN team_members tm ON tm.team_id = s.team_id
+			WHERE s.id = $1 AND s.team_id = $2 AND tm.user_id = $3 AND s.deleted_at IS NULL
+		)
+	`, serviceID, teamID, userID).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
 func (s *Server) emailExists(ctx context.Context, email string) (bool, error) {
 	var exists bool
 	err := s.db.QueryRow(ctx, `
@@ -528,6 +521,15 @@ func (s *Server) emailExists(ctx context.Context, email string) (bool, error) {
 		return false, err
 	}
 	return exists, nil
+}
+
+func matchesRepo(candidates []string, serviceRepo string) bool {
+	for _, c := range candidates {
+		if c != "" && c == serviceRepo {
+			return true
+		}
+	}
+	return false
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
@@ -562,6 +564,5 @@ func slugify(v string) string {
 			prevDash = true
 		}
 	}
-	out := strings.Trim(b.String(), "-")
-	return out
+	return strings.Trim(b.String(), "-")
 }

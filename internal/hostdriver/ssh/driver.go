@@ -252,7 +252,7 @@ func (d *Driver) run(ctx context.Context, command string) (string, error) {
 
 	select {
 	case <-ctx.Done():
-		_ = session.Signal(gossh.SIGKILL)
+		_ = session.Close()
 		return "", ctx.Err()
 	case err := <-done:
 		if err != nil {
@@ -306,7 +306,6 @@ func (s *sshReadCloser) Read(p []byte) (int, error) {
 }
 
 func (s *sshReadCloser) Close() error {
-	_ = s.session.Signal(gossh.SIGKILL)
 	_ = s.session.Close()
 	return s.client.Close()
 }

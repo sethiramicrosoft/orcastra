@@ -30,6 +30,10 @@ func main() {
 	}
 	defer pool.Close()
 
+	if err := db.MigrateUp(context.Background(), cfg.DatabaseURL); err != nil {
+		log.Fatal().Err(err).Msg("failed to apply database migrations")
+	}
+
 	server, err := api.NewServer(cfg, pool)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize API server")
@@ -47,9 +51,10 @@ func main() {
 		}
 	}()
 
+	workerCtx, workerCancel := context.WithCancel(context.Background())
 	worker := deployqueue.NewWorker(deployqueue.New(pool), 2*time.Second)
 	go func() {
-		if err := worker.Start(context.Background()); err != nil && err != context.Canceled {
+		if err := worker.Start(workerCtx); err != nil && err != context.Canceled {
 			log.Error().Err(err).Msg("deploy worker stopped")
 		}
 	}()
@@ -57,6 +62,7 @@ func main() {
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	<-shutdownCtx.Done()
+	workerCancel()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

@@ -53,8 +53,8 @@ func (q *Queue) Enqueue(ctx context.Context, in EnqueueInput) (*Deployment, erro
 		return nil, fmt.Errorf("serviceID, teamID and triggerType are required")
 	}
 
-	key := buildIdempotencyKey(in.ServiceID, in.CommitSHA)
 	deploymentID := uuid.NewString()
+	key := buildIdempotencyKey(in.ServiceID, in.CommitSHA, in.TriggerType, deploymentID)
 	now := time.Now().UTC()
 
 	_, err := q.db.Exec(ctx, `
@@ -170,9 +170,9 @@ func (q *Queue) AppendLog(ctx context.Context, deploymentID, stream, line string
 	return nil
 }
 
-func buildIdempotencyKey(serviceID, commitSHA string) string {
+func buildIdempotencyKey(serviceID, commitSHA, triggerType, nonce string) string {
 	if commitSHA == "" {
-		return fmt.Sprintf("%s:manual", serviceID)
+		return fmt.Sprintf("%s:%s:%s", serviceID, triggerType, nonce)
 	}
 	return fmt.Sprintf("%s:%s", serviceID, commitSHA)
 }

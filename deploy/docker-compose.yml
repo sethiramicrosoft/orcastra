@@ -2,7 +2,10 @@ version: "3.8"
 
 services:
   orcastra:
-    image: ghcr.io/sethiramicrosoft/orcastra:latest
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: sethiramicrosoft/orcastra:local
     restart: unless-stopped
     ports:
       - "3000:3000"
@@ -13,6 +16,8 @@ services:
       - DATABASE_URL=postgres://orcastra:${POSTGRES_PASSWORD}@postgres:5432/orcastra?sslmode=disable
       - JWT_SECRET=${JWT_SECRET}
       - GITHUB_WEBHOOK_SECRET=${GITHUB_WEBHOOK_SECRET}
+      - JWT_ISSUER=orcastra
+      - JWT_TTL=24h
       - CADDY_ADMIN_API=http://caddy:2019
     depends_on:
       postgres:

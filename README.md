@@ -22,13 +22,24 @@ When a deploy fails, Orcastra tells you why.
 - **Reverse proxy:** Caddy (automatic SSL)
 - **Distribution:** Docker Compose
 
-## Quick start
+## Quick start (local)
 
 ```bash
-curl -fsSL https://orcastra.dev/install.sh | sh
+cp .env.example .env
+docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
-Then open `http://your-server-ip:3000`.
+Then open `http://localhost:3000/healthz`.
+
+## Frontend (fun colorful UI shell)
+
+```bash
+cd web
+npm install
+npm run dev
+```
+
+Open `http://localhost:5173`.
 
 ## Why Orcastra over Coolify / Dokploy?
 
