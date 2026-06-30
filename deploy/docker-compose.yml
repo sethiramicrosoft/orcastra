@@ -1,0 +1,60 @@
+version: "3.8"
+
+services:
+  orcastra:
+    image: ghcr.io/sethiramicrosoft/orcastra:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - orcastra_data:/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - DATABASE_URL=postgres://orcastra:${POSTGRES_PASSWORD}@postgres:5432/orcastra?sslmode=disable
+      - SECRET_KEY=${SECRET_KEY}
+      - CADDY_ADMIN_API=http://caddy:2019
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - orcastra_net
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=orcastra
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=orcastra
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orcastra"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - orcastra_net
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "2019:2019"
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - orcastra_net
+
+volumes:
+  orcastra_data:
+  postgres_data:
+  caddy_data:
+  caddy_config:
+
+networks:
+  orcastra_net:
+    driver: bridge
