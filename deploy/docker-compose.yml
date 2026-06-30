@@ -11,7 +11,7 @@ services:
       - "3000:3000"
     volumes:
       - orcastra_data:/data
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - DATABASE_URL=postgres://orcastra:${POSTGRES_PASSWORD}@postgres:5432/orcastra?sslmode=disable
       - JWT_SECRET=${JWT_SECRET}

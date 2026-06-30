@@ -4,20 +4,32 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os/exec"
 	"strconv"
 	"strings"
 
+	dockertypes "github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/client"
+	"github.com/docker/go-connections/nat"
+
 	"github.com/sethiramicrosoft/orcastra/internal/hostdriver"
 )
 
-type Driver struct{}
+type Driver struct {
+	dc *client.Client
+}
 
-func New() *Driver {
-	return &Driver{}
+func New() (*Driver, error) {
+	dc, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return nil, fmt.Errorf("create docker client: %w", err)
+	}
+	return &Driver{dc: dc}, nil
 }
 
 func (d *Driver) RunContainer(ctx context.Context, spec hostdriver.ContainerSpec) (string, error) {
@@ -25,113 +37,110 @@ func (d *Driver) RunContainer(ctx context.Context, spec hostdriver.ContainerSpec
 		return "", fmt.Errorf("container image is required")
 	}
 
-	args := []string{"run", "-d"}
+	// Pull image first (ignore error if already present)
+	rc, err := d.dc.ImagePull(ctx, spec.Image, image.PullOptions{})
+	if err == nil {
+		io.Copy(io.Discard, rc)
+		rc.Close()
+	}
+
+	// Remove any existing container with the same name
 	if spec.Name != "" {
-		args = append(args, "--name", spec.Name)
+		d.dc.ContainerRemove(ctx, spec.Name, container.RemoveOptions{Force: true}) //nolint:errcheck
 	}
-	for k, v := range spec.Env {
-		args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
-	}
+
+	// Build port bindings
+	exposedPorts := nat.PortSet{}
+	portBindings := nat.PortMap{}
 	for _, p := range spec.Ports {
 		proto := p.Protocol
 		if proto == "" {
 			proto = "tcp"
 		}
-		args = append(args, "-p", fmt.Sprintf("%d:%d/%s", p.HostPort, p.ContainerPort, proto))
+		cPort := nat.Port(fmt.Sprintf("%d/%s", p.ContainerPort, proto))
+		exposedPorts[cPort] = struct{}{}
+		portBindings[cPort] = []nat.PortBinding{{HostPort: fmt.Sprintf("%d", p.HostPort)}}
 	}
+
+	// Build env slice
+	var envSlice []string
+	for k, v := range spec.Env {
+		envSlice = append(envSlice, fmt.Sprintf("%s=%s", k, v))
+	}
+
+	// Build volume binds
+	var binds []string
 	for _, v := range spec.Volumes {
 		mode := "rw"
 		if v.ReadOnly {
 			mode = "ro"
 		}
-		args = append(args, "-v", fmt.Sprintf("%s:%s:%s", v.HostPath, v.ContainerPath, mode))
+		binds = append(binds, fmt.Sprintf("%s:%s:%s", v.HostPath, v.ContainerPath, mode))
 	}
-	for k, v := range spec.Labels {
-		args = append(args, "--label", fmt.Sprintf("%s=%s", k, v))
-	}
-	args = append(args, spec.Image)
 
-	out, err := runDocker(ctx, args...)
+	resp, err := d.dc.ContainerCreate(ctx,
+		&container.Config{
+			Image:        spec.Image,
+			Env:          envSlice,
+			Labels:       spec.Labels,
+			ExposedPorts: exposedPorts,
+		},
+		&container.HostConfig{
+			PortBindings: portBindings,
+			Binds:        binds,
+			RestartPolicy: container.RestartPolicy{
+				Name: "unless-stopped",
+			},
+		},
+		nil, nil, spec.Name,
+	)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("create container: %w", err)
 	}
-	return strings.TrimSpace(out), nil
+
+	if err := d.dc.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		return "", fmt.Errorf("start container: %w", err)
+	}
+	return resp.ID, nil
 }
 
 func (d *Driver) RemoveContainer(ctx context.Context, id string, force bool) error {
 	if id == "" {
 		return fmt.Errorf("container ID is required")
 	}
-	args := []string{"rm"}
-	if force {
-		args = append(args, "-f")
-	}
-	args = append(args, id)
-	_, err := runDocker(ctx, args...)
-	return err
+	return d.dc.ContainerRemove(ctx, id, container.RemoveOptions{Force: force})
 }
 
 func (d *Driver) StreamLogs(ctx context.Context, containerID string, follow bool) (io.ReadCloser, error) {
 	if containerID == "" {
 		return nil, fmt.Errorf("container ID is required")
 	}
-	args := []string{"logs"}
-	if follow {
-		args = append(args, "-f")
-	}
-	args = append(args, containerID)
-
-	cmd := exec.CommandContext(ctx, "docker", args...)
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, fmt.Errorf("open stderr pipe: %w", err)
-	}
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("open stdout pipe: %w", err)
-	}
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start docker logs: %w", err)
-	}
-	return newCmdReadCloser(cmd, stdoutPipe, stderrPipe), nil
+	return d.dc.ContainerLogs(ctx, containerID, container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Follow:     follow,
+		Timestamps: false,
+	})
 }
 
 func (d *Driver) Inspect(ctx context.Context, containerID string) (*hostdriver.ContainerInfo, error) {
 	if containerID == "" {
 		return nil, fmt.Errorf("container ID is required")
 	}
-	out, err := runDocker(ctx, "inspect", containerID)
+	info, err := d.dc.ContainerInspect(ctx, containerID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("inspect container: %w", err)
 	}
-
-	var inspect []struct {
-		ID    string `json:"Id"`
-		Name  string `json:"Name"`
-		Image string `json:"Image"`
-		State struct {
-			Status  string `json:"Status"`
-			Running bool   `json:"Running"`
-		} `json:"State"`
-	}
-	if err := json.Unmarshal([]byte(out), &inspect); err != nil {
-		return nil, fmt.Errorf("parse docker inspect: %w", err)
-	}
-	if len(inspect) == 0 {
-		return nil, fmt.Errorf("container not found")
-	}
-	item := inspect[0]
 	return &hostdriver.ContainerInfo{
-		ID:      item.ID,
-		Name:    strings.TrimPrefix(item.Name, "/"),
-		Image:   item.Image,
-		Status:  item.State.Status,
-		Running: item.State.Running,
+		ID:      info.ID,
+		Name:    strings.TrimPrefix(info.Name, "/"),
+		Image:   info.Config.Image,
+		Status:  info.State.Status,
+		Running: info.State.Running,
 	}, nil
 }
 
 func (d *Driver) ReadMetrics(ctx context.Context) (*hostdriver.Metrics, error) {
-	// CPU usage from /proc/stat, memory+disk from standard Linux commands.
 	cmd := exec.CommandContext(ctx, "sh", "-c", `awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END {print t, a}' /proc/meminfo; df -k / | awk 'NR==2 {print $2, $3}'`)
 	out, err := cmd.Output()
 	if err != nil {
@@ -154,7 +163,7 @@ func (d *Driver) ReadMetrics(ctx context.Context) (*hostdriver.Metrics, error) {
 	diskUsedKB, _ := strconv.ParseInt(diskParts[1], 10, 64)
 
 	return &hostdriver.Metrics{
-		CPUPercent:     0, // CPU sampling window is added in the metrics collector layer.
+		CPUPercent:     0,
 		MemTotalBytes:  memTotalKB * 1024,
 		MemUsedBytes:   (memTotalKB - memAvailKB) * 1024,
 		DiskTotalBytes: diskTotalKB * 1024,
@@ -176,17 +185,16 @@ func (d *Driver) WriteFile(ctx context.Context, path string, data []byte, mode u
 }
 
 func (d *Driver) Ping(ctx context.Context) error {
-	_, err := runDocker(ctx, "version", "--format", "{{.Server.Version}}")
+	_, err := d.dc.Ping(ctx)
 	return err
 }
 
-func runDocker(ctx context.Context, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "docker", args...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("docker %s failed: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+func (d *Driver) ListContainers(ctx context.Context, labelFilter map[string]string) ([]dockertypes.Container, error) {
+	f := filters.NewArgs()
+	for k, v := range labelFilter {
+		f.Add("label", fmt.Sprintf("%s=%s", k, v))
 	}
-	return string(out), nil
+	return d.dc.ContainerList(ctx, container.ListOptions{Filters: f})
 }
 
 type cmdReadCloser struct {

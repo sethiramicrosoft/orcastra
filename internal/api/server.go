@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -137,7 +138,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	_, err = tx.Exec(ctx, `
 		INSERT INTO users (id, email, password_hash, display_name, is_root_admin)
-		VALUES ($1, $2, $3, $4, false)
+		VALUES ($1::uuid, $2, $3, $4, false)
 	`, userID, strings.ToLower(strings.TrimSpace(req.Email)), passwordHash, nullableString(req.DisplayName))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create user")
@@ -146,7 +147,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	_, err = tx.Exec(ctx, `
 		INSERT INTO teams (id, name, slug)
-		VALUES ($1, $2, $3)
+		VALUES ($1::uuid, $2, $3)
 	`, teamID, req.TeamName, teamSlug)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create team")
@@ -155,7 +156,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	_, err = tx.Exec(ctx, `
 		INSERT INTO team_members (team_id, user_id, role)
-		VALUES ($1, $2, 'owner')
+		VALUES ($1::uuid, $2::uuid, 'owner')
 	`, teamID, userID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to link user to team")
@@ -164,9 +165,10 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	_, err = tx.Exec(ctx, `
 		INSERT INTO audit_events (actor_id, action, resource_type, resource_id, team_id, meta)
-		VALUES ($1, 'auth.register', 'user', $1, $2, jsonb_build_object('email', $3))
+		VALUES ($1::uuid, 'auth.register', 'user', $1::uuid, $2::uuid, jsonb_build_object('email', $3::text))
 	`, userID, teamID, strings.ToLower(strings.TrimSpace(req.Email)))
 	if err != nil {
+		log.Printf("audit insert failed (register): %v", err)
 		writeError(w, http.StatusInternalServerError, "failed to write audit event")
 		return
 	}
@@ -257,9 +259,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	_, err = s.db.Exec(ctx, `
 		INSERT INTO audit_events (actor_id, action, resource_type, resource_id, team_id)
-		VALUES ($1, 'auth.login', 'user', $1, $2)
+		VALUES ($1::uuid, 'auth.login', 'user', $1::uuid, $2::uuid)
 	`, userID, teamID)
 	if err != nil {
+		log.Printf("audit insert failed (login): %v", err)
 		writeError(w, http.StatusInternalServerError, "failed to write audit event")
 		return
 	}
@@ -393,9 +396,10 @@ func (s *Server) handleManualDeploy(w http.ResponseWriter, r *http.Request) {
 
 	_, err = s.db.Exec(r.Context(), `
 		INSERT INTO audit_events (actor_id, action, resource_type, resource_id, team_id, meta)
-		VALUES ($1, 'service.deploy.manual', 'deployment', $2, $3, jsonb_build_object('serviceId', $4, 'commitSha', $5))
+		VALUES ($1::uuid, 'service.deploy.manual', 'deployment', $2::uuid, $3::uuid, jsonb_build_object('serviceId', $4::text, 'commitSha', $5::text))
 	`, claims.UserID, dep.ID, claims.TeamID, serviceID, nullableString(req.CommitSHA))
 	if err != nil {
+		log.Printf("audit insert failed (manual deploy): %v", err)
 		writeError(w, http.StatusInternalServerError, "failed to write audit event")
 		return
 	}
@@ -777,7 +781,7 @@ func (s *Server) handleEnsureLocalhostServer(w http.ResponseWriter, r *http.Requ
 	id := uuid.NewString()
 	_, err = s.db.Exec(ctx, `
 		INSERT INTO servers (id, team_id, name, host, port, ssh_user, ssh_key_ct, ssh_key_kid, status, is_localhost, docker_version)
-		VALUES ($1, $2, 'localhost', '127.0.0.1', 22, 'local', $3, 'localhost', 'reachable', true, 'local-docker')
+		VALUES ($1::uuid, $2::uuid, 'localhost', '127.0.0.1', 22, 'local', $3, 'localhost', 'reachable', true, 'local-docker')
 	`, id, claims.TeamID, []byte("localhost"))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create localhost server")
@@ -785,7 +789,7 @@ func (s *Server) handleEnsureLocalhostServer(w http.ResponseWriter, r *http.Requ
 	}
 	_, _ = s.db.Exec(ctx, `
 		INSERT INTO audit_events (actor_id, action, resource_type, resource_id, team_id)
-		VALUES ($1, 'server.localhost.create', 'server', $2, $3)
+		VALUES ($1::uuid, 'server.localhost.create', 'server', $2::uuid, $3::uuid)
 	`, claims.UserID, id, claims.TeamID)
 	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "created": true})
 }
@@ -826,7 +830,7 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	projectID := uuid.NewString()
 	_, err = s.db.Exec(r.Context(), `
 		INSERT INTO projects (id, team_id, server_id, name, description)
-		VALUES ($1, $2, $3, $4, $5)
+		VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5)
 	`, projectID, claims.TeamID, req.ServerID, strings.TrimSpace(req.Name), nullableString(req.Description))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create project")
@@ -834,7 +838,7 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	}
 	_, _ = s.db.Exec(r.Context(), `
 		INSERT INTO audit_events (actor_id, action, resource_type, resource_id, team_id)
-		VALUES ($1, 'project.create', 'project', $2, $3)
+		VALUES ($1::uuid, 'project.create', 'project', $2::uuid, $3::uuid)
 	`, claims.UserID, projectID, claims.TeamID)
 	writeJSON(w, http.StatusCreated, map[string]any{"id": projectID})
 }
@@ -887,7 +891,7 @@ func (s *Server) handleCreateService(w http.ResponseWriter, r *http.Request) {
 	}
 	_, err = s.db.Exec(r.Context(), `
 		INSERT INTO services (id, project_id, team_id, name, type, docker_image, git_repo_url, git_branch, port)
-		VALUES ($1, $2, $3, $4, $5::service_type, $6, $7, $8, $9)
+		VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::service_type, $6, $7, $8, $9)
 	`, serviceID, req.ProjectID, claims.TeamID, strings.TrimSpace(req.Name), serviceType, strings.TrimSpace(req.DockerImage), nullableString(req.GitRepoURL), gitBranch, req.Port)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create service")
@@ -895,7 +899,7 @@ func (s *Server) handleCreateService(w http.ResponseWriter, r *http.Request) {
 	}
 	_, _ = s.db.Exec(r.Context(), `
 		INSERT INTO audit_events (actor_id, action, resource_type, resource_id, team_id)
-		VALUES ($1, 'service.create', 'service', $2, $3)
+		VALUES ($1::uuid, 'service.create', 'service', $2::uuid, $3::uuid)
 	`, claims.UserID, serviceID, claims.TeamID)
 	writeJSON(w, http.StatusCreated, map[string]any{"id": serviceID})
 }

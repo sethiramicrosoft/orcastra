@@ -20,9 +20,13 @@ func NewWorker(queue *Queue, pollInterval time.Duration) *Worker {
 	if pollInterval <= 0 {
 		pollInterval = 2 * time.Second
 	}
+	ld, err := local.New()
+	if err != nil {
+		ld = nil
+	}
 	return &Worker{
 		queue:        queue,
-		localDriver:  local.New(),
+		localDriver:  ld,
 		pollInterval: pollInterval,
 	}
 }
