@@ -28,3 +28,7 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# Frontend built assets (generated at Docker build time)
+cmd/orcastra/ui/assets/
+cmd/orcastra/ui/index.html

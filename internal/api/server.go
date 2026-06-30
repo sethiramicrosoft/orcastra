@@ -63,6 +63,37 @@ func (s *Server) Routes() http.Handler {
 	return r
 }
 
+// RoutesWithUI mounts all API routes plus a catch-all that serves the embedded SPA.
+func (s *Server) RoutesWithUI(uiHandler http.Handler) http.Handler {
+	r := chi.NewRouter()
+	r.Get("/healthz", s.handleHealthz)
+
+	r.Post("/api/v1/auth/register", s.handleRegister)
+	r.Post("/api/v1/auth/login", s.handleLogin)
+	r.With(s.requireAuth).Get("/api/v1/auth/me", s.handleMe)
+	r.With(s.requireAuth).Get("/api/v1/dashboard", s.handleDashboard)
+	r.With(s.requireAuth).Get("/api/v1/deployments/recent", s.handleRecentDeployments)
+	r.With(s.requireAuth).Get("/api/v1/deployments/{deploymentID}/stream", s.handleDeploymentStream)
+	r.With(s.requireAuth).Get("/api/v1/services", s.handleListServices)
+	r.With(s.requireAuth).Post("/api/v1/servers/localhost", s.handleEnsureLocalhostServer)
+	r.With(s.requireAuth).Post("/api/v1/projects", s.handleCreateProject)
+	r.With(s.requireAuth).Post("/api/v1/services", s.handleCreateService)
+	r.With(s.requireAuth).Post("/api/v1/ai/provider", s.handleUpsertAIProvider)
+
+	r.With(s.requireAuth).Post("/api/v1/services/{serviceID}/deploy", s.handleManualDeploy)
+	r.Post("/api/v1/webhooks/github", s.handleGitHubWebhook)
+
+	// Serve frontend SPA for all non-API routes.
+	r.NotFound(func(w http.ResponseWriter, req *http.Request) {
+		// If the path has a file extension and isn't found, let the file server 404.
+		// Otherwise fall back to index.html for client-side routing.
+		uiHandler.ServeHTTP(w, req)
+	})
+	r.Handle("/*", uiHandler)
+
+	return r
+}
+
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }

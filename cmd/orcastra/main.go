@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"embed"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/signal"
@@ -15,6 +17,9 @@ import (
 	"github.com/sethiramicrosoft/orcastra/internal/db"
 	"github.com/sethiramicrosoft/orcastra/internal/deployqueue"
 )
+
+//go:embed ui
+var uiAssets embed.FS
 
 func main() {
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339})
@@ -38,9 +43,18 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize API server")
 	}
+
+	// Serve embedded frontend with SPA fallback
+	uiFS, err := fs.Sub(uiAssets, "ui")
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to setup UI filesystem")
+	}
+	fileServer := http.FileServer(http.FS(uiFS))
+	routes := server.RoutesWithUI(fileServer)
+
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddress(),
-		Handler:           server.Routes(),
+		Handler:           routes,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
