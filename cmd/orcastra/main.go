@@ -13,6 +13,7 @@ import (
 
 	"github.com/sethiramicrosoft/orcastra/internal/api"
 	"github.com/sethiramicrosoft/orcastra/internal/db"
+	"github.com/sethiramicrosoft/orcastra/internal/deployqueue"
 )
 
 func main() {
@@ -43,6 +44,13 @@ func main() {
 		log.Info().Str("addr", cfg.ListenAddress()).Msg("orcastra API listening")
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatal().Err(err).Msg("http server failed")
+		}
+	}()
+
+	worker := deployqueue.NewWorker(deployqueue.New(pool), 2*time.Second)
+	go func() {
+		if err := worker.Start(context.Background()); err != nil && err != context.Canceled {
+			log.Error().Err(err).Msg("deploy worker stopped")
 		}
 	}()
 
