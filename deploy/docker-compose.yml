@@ -11,7 +11,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
       - DATABASE_URL=postgres://orcastra:${POSTGRES_PASSWORD}@postgres:5432/orcastra?sslmode=disable
-      - SECRET_KEY=${SECRET_KEY}
+      - JWT_SECRET=${JWT_SECRET}
       - CADDY_ADMIN_API=http://caddy:2019
     depends_on:
       postgres:
