@@ -1,6 +1,8 @@
 # Orcastra
 
-> Self-hosted VPS management platform — deploy apps, databases, and services on your own servers, with AI-powered deploy failure analysis.
+> The self-hosted PaaS where the AI isn't bolted on — it's the product.
+
+Deploy apps, databases, and services on your own servers. When something breaks, Orcastra tells you why and offers to fix it.
 
 ## What it is
 
@@ -28,16 +30,30 @@ curl -fsSL https://orcastra.dev/install.sh | sh
 
 Then open `http://your-server-ip:3000`.
 
+## Why Orcastra over Coolify / Dokploy?
+
+Those tools deploy your app. Orcastra deploys your app **and understands it**.
+
+- Every deploy failure gets a plain-English diagnosis and a suggested fix
+- Deploy history is indexed so the AI can spot patterns ("this fails every time after a DB migration")
+- One-click "open a fix PR" — not just a suggestion, an actual pull request
+- Proactive health monitoring — AI alerts you before users notice
+- Natural-language onboarding: paste your `docker run` command, get a configured service
+
+Bring your own LLM: OpenAI, Anthropic, Gemini, OpenRouter (200+ models), Groq, Mistral, Ollama (local/free), or any OpenAI-compatible endpoint.
+
 ## Features (v1 scope)
 
-- [ ] SSH server onboarding (keypair-based, never paste your private key)
-- [ ] Docker container orchestration (deploy apps, databases, workers)
+- [ ] SSH server onboarding (keypair-based, Orcastra generates the keypair)
+- [ ] Docker container orchestration (apps, databases, workers)
 - [ ] Caddy reverse proxy with automatic Let's Encrypt SSL
 - [ ] Git webhook auto-deploy (GitHub, GitLab, Bitbucket)
-- [ ] Real-time deploy logs (SSE)
+- [ ] Real-time deploy logs (SSE, structured + stored for AI)
 - [ ] Resource monitoring (CPU, RAM, disk)
-- [ ] Multi-user auth (teams, roles)
-- [ ] **AI deploy failure analysis** — when a deploy fails, get a one-sentence diagnosis and suggested fix (bring your own OpenAI/Anthropic API key)
+- [ ] Multi-user auth (teams, roles, audit log)
+- [ ] **AI deploy failure analysis** — diagnosis + suggested fix on every failure
+- [ ] **AI fix PR** — one click to open a pull request with the suggested change
+- [ ] **AI health monitoring** — plain-English alerts, not just graphs
 
 ## Architecture principles
 
