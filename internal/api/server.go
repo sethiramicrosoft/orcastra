@@ -18,14 +18,16 @@ import (
 
 	"github.com/sethiramicrosoft/orcastra/internal/auth"
 	"github.com/sethiramicrosoft/orcastra/internal/deployqueue"
+	"github.com/sethiramicrosoft/orcastra/internal/secretcrypto"
 	"github.com/sethiramicrosoft/orcastra/internal/webhookingest"
 )
 
 type Server struct {
-	cfg    Config
-	db     *pgxpool.Pool
-	signer *auth.JWTSigner
-	queue  *deployqueue.Queue
+	cfg       Config
+	db        *pgxpool.Pool
+	signer    *auth.JWTSigner
+	queue     *deployqueue.Queue
+	secCipher *secretcrypto.Cipher
 }
 
 func NewServer(cfg Config, db *pgxpool.Pool) (*Server, error) {
@@ -33,11 +35,16 @@ func NewServer(cfg Config, db *pgxpool.Pool) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("configure jwt signer: %w", err)
 	}
+	secCipher, err := secretcrypto.New(cfg.EncryptionKeyB64, cfg.EncryptionKeyID, cfg.JWTSecret)
+	if err != nil {
+		return nil, fmt.Errorf("configure secret crypto: %w", err)
+	}
 	return &Server{
-		cfg:    cfg,
-		db:     db,
-		signer: signer,
-		queue:  deployqueue.New(db),
+		cfg:       cfg,
+		db:        db,
+		signer:    signer,
+		queue:     deployqueue.New(db, secCipher),
+		secCipher: secCipher,
 	}, nil
 }
 
@@ -320,11 +327,17 @@ const claimsContextKey authContextKey = "claims"
 func (s *Server) requireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authz := r.Header.Get("Authorization")
-		if !strings.HasPrefix(authz, "Bearer ") {
+		token := ""
+		if strings.HasPrefix(authz, "Bearer ") {
+			token = strings.TrimPrefix(authz, "Bearer ")
+		} else {
+			// EventSource cannot set Authorization headers.
+			token = strings.TrimSpace(r.URL.Query().Get("token"))
+		}
+		if token == "" {
 			writeError(w, http.StatusUnauthorized, "missing bearer token")
 			return
 		}
-		token := strings.TrimPrefix(authz, "Bearer ")
 		claims, err := s.signer.Parse(token)
 		if err != nil {
 			writeError(w, http.StatusUnauthorized, "invalid token")
@@ -938,10 +951,15 @@ func (s *Server) handleUpsertServiceSecret(w http.ResponseWriter, r *http.Reques
 	}
 
 	secretID := uuid.NewString()
+	encryptedValue, valueKID, encErr := s.secCipher.EncryptString(req.Value)
+	if encErr != nil {
+		writeError(w, http.StatusInternalServerError, "failed to encrypt service secret")
+		return
+	}
 	_, err = s.db.Exec(r.Context(), `
 		INSERT INTO secrets (id, service_id, team_id, key, value_ct, value_kid, version)
-		VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, 'plain-v1', $6)
-	`, secretID, serviceID, claims.TeamID, req.Key, []byte(req.Value), version)
+		VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7)
+	`, secretID, serviceID, claims.TeamID, req.Key, encryptedValue, valueKID, version)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to store service secret")
 		return
@@ -1133,6 +1151,18 @@ func (s *Server) handleUpsertAIProvider(w http.ResponseWriter, r *http.Request) 
 	if req.Enabled != nil {
 		enabled = *req.Enabled
 	}
+	apiKeyCT := any(nil)
+	apiKeyKID := any(nil)
+	trimmedAPIKey := strings.TrimSpace(req.APIKey)
+	if trimmedAPIKey != "" {
+		enc, kid, encErr := s.secCipher.EncryptString(trimmedAPIKey)
+		if encErr != nil {
+			writeError(w, http.StatusInternalServerError, "failed to encrypt API key")
+			return
+		}
+		apiKeyCT = enc
+		apiKeyKID = kid
+	}
 	id := uuid.NewString()
 	_, err := s.db.Exec(r.Context(), `
 		INSERT INTO ai_provider_configs (id, team_id, provider_type, display_name, base_url, model, api_key_ct, api_key_kid, is_enabled, updated_at)
@@ -1146,7 +1176,7 @@ func (s *Server) handleUpsertAIProvider(w http.ResponseWriter, r *http.Request) 
 		              api_key_kid = EXCLUDED.api_key_kid,
 		              is_enabled = EXCLUDED.is_enabled,
 		              updated_at = now()
-	`, id, claims.TeamID, strings.TrimSpace(req.ProviderType), nonEmptyOrFallback(strings.TrimSpace(req.DisplayName), strings.TrimSpace(req.ProviderType)), nullableString(req.BaseURL), strings.TrimSpace(req.Model), nullableBytes(strings.TrimSpace(req.APIKey)), keyIDOrNil(strings.TrimSpace(req.APIKey)), enabled)
+	`, id, claims.TeamID, strings.TrimSpace(req.ProviderType), nonEmptyOrFallback(strings.TrimSpace(req.DisplayName), strings.TrimSpace(req.ProviderType)), nullableString(req.BaseURL), strings.TrimSpace(req.Model), apiKeyCT, apiKeyKID, enabled)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to upsert AI provider config")
 		return
@@ -1154,25 +1184,11 @@ func (s *Server) handleUpsertAIProvider(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func nullableBytes(v string) any {
-	if strings.TrimSpace(v) == "" {
-		return nil
-	}
-	return []byte(strings.TrimSpace(v))
-}
-
 func nonEmptyOrFallback(v string, fallback string) string {
 	if strings.TrimSpace(v) == "" {
 		return fallback
 	}
 	return strings.TrimSpace(v)
-}
-
-func keyIDOrNil(apiKey string) any {
-	if strings.TrimSpace(apiKey) == "" {
-		return nil
-	}
-	return "plain-v1"
 }
 
 func marshalJSON(v any) string {

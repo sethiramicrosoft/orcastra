@@ -16,6 +16,7 @@ import (
 	"github.com/sethiramicrosoft/orcastra/internal/api"
 	"github.com/sethiramicrosoft/orcastra/internal/db"
 	"github.com/sethiramicrosoft/orcastra/internal/deployqueue"
+	"github.com/sethiramicrosoft/orcastra/internal/secretcrypto"
 )
 
 //go:embed ui
@@ -66,7 +67,11 @@ func main() {
 	}()
 
 	workerCtx, workerCancel := context.WithCancel(context.Background())
-	worker := deployqueue.NewWorker(deployqueue.New(pool), 2*time.Second)
+	secCipher, err := secretcrypto.New(cfg.EncryptionKeyB64, cfg.EncryptionKeyID, cfg.JWTSecret)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to initialize secret crypto")
+	}
+	worker := deployqueue.NewWorker(deployqueue.New(pool, secCipher), 2*time.Second)
 	go func() {
 		if err := worker.Start(workerCtx); err != nil && err != context.Canceled {
 			log.Error().Err(err).Msg("deploy worker stopped")

@@ -4,19 +4,23 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/sethiramicrosoft/orcastra/internal/secretcrypto"
 )
 
 type Queue struct {
-	db *pgxpool.Pool
+	db     *pgxpool.Pool
+	cipher *secretcrypto.Cipher
 }
 
-func New(db *pgxpool.Pool) *Queue {
-	return &Queue{db: db}
+func New(db *pgxpool.Pool, c *secretcrypto.Cipher) *Queue {
+	return &Queue{db: db, cipher: c}
 }
 
 type EnqueueInput struct {
@@ -49,6 +53,12 @@ type Job struct {
 	GitRepoURL   string
 	GitBranch    string
 	IsLocalhost  bool
+	SSHHost      string
+	SSHPort      int
+	SSHUser      string
+	SSHKey       []byte
+	SSHKeyKID    string
+	SSHFP        string
 }
 
 type AIProviderConfig struct {
@@ -116,7 +126,13 @@ func (q *Queue) ClaimNext(ctx context.Context) (*Job, error) {
 			       COALESCE(s.docker_image, '') AS docker_image,
 			       COALESCE(s.git_repo_url, '') AS git_repo_url,
 			       COALESCE(s.git_branch, 'main') AS git_branch,
-			       srv.is_localhost
+			       srv.is_localhost,
+			       COALESCE(srv.host, '') AS ssh_host,
+			       COALESCE(srv.port, 22) AS ssh_port,
+			       COALESCE(srv.ssh_user, 'root') AS ssh_user,
+			       srv.ssh_key_ct,
+			       COALESCE(srv.ssh_key_kid, '') AS ssh_key_kid,
+			       COALESCE(srv.ssh_host_fingerprint, '') AS ssh_host_fingerprint
 			FROM deployments d
 			JOIN services s ON s.id = d.service_id
 			JOIN projects p ON p.id = s.project_id
@@ -130,7 +146,7 @@ func (q *Queue) ClaimNext(ctx context.Context) (*Job, error) {
 		SET status = 'building', started_at = now()
 		FROM next_job
 		WHERE d.id = next_job.id
-		RETURNING next_job.id, next_job.service_id, next_job.team_id, next_job.service_name, next_job.trigger_type, next_job.commit_sha, next_job.docker_image, next_job.git_repo_url, next_job.git_branch, next_job.is_localhost
+		RETURNING next_job.id, next_job.service_id, next_job.team_id, next_job.service_name, next_job.trigger_type, next_job.commit_sha, next_job.docker_image, next_job.git_repo_url, next_job.git_branch, next_job.is_localhost, next_job.ssh_host, next_job.ssh_port, next_job.ssh_user, next_job.ssh_key_ct, next_job.ssh_key_kid, next_job.ssh_host_fingerprint
 	`).Scan(
 		&job.DeploymentID,
 		&job.ServiceID,
@@ -142,6 +158,12 @@ func (q *Queue) ClaimNext(ctx context.Context) (*Job, error) {
 		&job.GitRepoURL,
 		&job.GitBranch,
 		&job.IsLocalhost,
+		&job.SSHHost,
+		&job.SSHPort,
+		&job.SSHUser,
+		&job.SSHKey,
+		&job.SSHKeyKID,
+		&job.SSHFP,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -152,6 +174,16 @@ func (q *Queue) ClaimNext(ctx context.Context) (*Job, error) {
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit claim transaction: %w", err)
+	}
+	if !job.IsLocalhost && len(job.SSHKey) > 0 && job.SSHKeyKID != "" && job.SSHKeyKID != "plain-v1" {
+		if q.cipher == nil {
+			return nil, fmt.Errorf("encrypted ssh key found but cipher is not configured")
+		}
+		plain, decErr := q.cipher.Decrypt(job.SSHKey)
+		if decErr != nil {
+			return nil, fmt.Errorf("decrypt ssh private key: %w", decErr)
+		}
+		job.SSHKey = plain
 	}
 	return &job, nil
 }
@@ -213,13 +245,14 @@ func (q *Queue) GetAIProviderConfig(ctx context.Context, teamID string) (*AIProv
 		cfg      AIProviderConfig
 		baseURL  *string
 		apiKeyCT []byte
+		apiKeyK  *string
 	)
 	err := q.db.QueryRow(ctx, `
-		SELECT provider_type, base_url, model, api_key_ct, is_enabled
+		SELECT provider_type, base_url, model, api_key_ct, api_key_kid, is_enabled
 		FROM ai_provider_configs
 		WHERE team_id = $1
 		LIMIT 1
-	`, teamID).Scan(&cfg.ProviderType, &baseURL, &cfg.Model, &apiKeyCT, &cfg.Enabled)
+	`, teamID).Scan(&cfg.ProviderType, &baseURL, &cfg.Model, &apiKeyCT, &apiKeyK, &cfg.Enabled)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -230,7 +263,23 @@ func (q *Queue) GetAIProviderConfig(ctx context.Context, teamID string) (*AIProv
 		cfg.BaseURL = *baseURL
 	}
 	if len(apiKeyCT) > 0 {
-		cfg.APIKey = string(apiKeyCT)
+		kid := ""
+		if apiKeyK != nil {
+			kid = strings.TrimSpace(*apiKeyK)
+		}
+		switch kid {
+		case "", "plain-v1":
+			cfg.APIKey = string(apiKeyCT)
+		default:
+			if q.cipher == nil {
+				return nil, fmt.Errorf("encrypted ai provider key found but cipher is not configured")
+			}
+			plain, decErr := q.cipher.Decrypt(apiKeyCT)
+			if decErr != nil {
+				return nil, fmt.Errorf("decrypt ai provider key: %w", decErr)
+			}
+			cfg.APIKey = string(plain)
+		}
 	}
 	return &cfg, nil
 }
@@ -239,7 +288,8 @@ func (q *Queue) GetLatestServiceSecrets(ctx context.Context, serviceID, teamID s
 	rows, err := q.db.Query(ctx, `
 		SELECT DISTINCT ON (s.key)
 			s.key,
-			COALESCE(convert_from(s.value_ct, 'UTF8'), ''),
+			s.value_ct,
+			COALESCE(s.value_kid, ''),
 			s.version,
 			s.created_at
 		FROM secrets s
@@ -255,8 +305,23 @@ func (q *Queue) GetLatestServiceSecrets(ctx context.Context, serviceID, teamID s
 	out := make([]ServiceSecret, 0)
 	for rows.Next() {
 		var item ServiceSecret
-		if scanErr := rows.Scan(&item.Key, &item.Value, &item.Version, &item.CreatedAt); scanErr != nil {
+		var valueCT []byte
+		var valueKID string
+		if scanErr := rows.Scan(&item.Key, &valueCT, &valueKID, &item.Version, &item.CreatedAt); scanErr != nil {
 			return nil, fmt.Errorf("scan service secret: %w", scanErr)
+		}
+		switch strings.TrimSpace(valueKID) {
+		case "", "plain-v1":
+			item.Value = string(valueCT)
+		default:
+			if q.cipher == nil {
+				return nil, fmt.Errorf("encrypted service secret found but cipher is not configured")
+			}
+			plain, decErr := q.cipher.Decrypt(valueCT)
+			if decErr != nil {
+				return nil, fmt.Errorf("decrypt service secret %s: %w", item.Key, decErr)
+			}
+			item.Value = string(plain)
 		}
 		out = append(out, item)
 	}

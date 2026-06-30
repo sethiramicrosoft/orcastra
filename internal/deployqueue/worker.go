@@ -8,6 +8,7 @@ import (
 	"github.com/sethiramicrosoft/orcastra/internal/ai"
 	"github.com/sethiramicrosoft/orcastra/internal/hostdriver"
 	"github.com/sethiramicrosoft/orcastra/internal/hostdriver/local"
+	driverssh "github.com/sethiramicrosoft/orcastra/internal/hostdriver/ssh"
 )
 
 type Worker struct {
@@ -56,18 +57,9 @@ func (w *Worker) processOnce(ctx context.Context) error {
 		return nil
 	}
 
-	if !job.IsLocalhost {
-		_ = w.queue.AppendLog(ctx, job.DeploymentID, "stderr", "remote deployment path not wired yet")
-		return w.markFailedWithAI(ctx, job, "Remote deployment is not yet enabled for this build.", "Use localhost server for now, or wait for SSH executor wiring.")
-	}
-
 	if job.DockerImage == "" {
 		_ = w.queue.AppendLog(ctx, job.DeploymentID, "stderr", "service has no docker_image")
 		return w.markFailedWithAI(ctx, job, "Service is missing docker_image.", "Set docker_image on the service before deploying.")
-	}
-	if w.localDriver == nil {
-		_ = w.queue.AppendLog(ctx, job.DeploymentID, "stderr", "local driver unavailable")
-		return w.markFailedWithAI(ctx, job, "Local host driver is unavailable.", "Restart Orcastra and confirm Docker socket access.")
 	}
 
 	envVars, envErr := w.queue.BuildServiceEnv(ctx, job.ServiceID, job.TeamID)
@@ -76,8 +68,31 @@ func (w *Worker) processOnce(ctx context.Context) error {
 		return w.markFailedWithAI(ctx, job, "Failed to load service secrets.", envErr.Error())
 	}
 
+	var driver hostdriver.HostDriver
+	if job.IsLocalhost {
+		if w.localDriver == nil {
+			_ = w.queue.AppendLog(ctx, job.DeploymentID, "stderr", "local driver unavailable")
+			return w.markFailedWithAI(ctx, job, "Local host driver is unavailable.", "Restart Orcastra and confirm Docker socket access.")
+		}
+		driver = w.localDriver
+	} else {
+		sshDriver, sshErr := driverssh.New(driverssh.Config{
+			Host:        job.SSHHost,
+			Port:        job.SSHPort,
+			User:        job.SSHUser,
+			PrivateKey:  job.SSHKey,
+			Fingerprint: job.SSHFP,
+			Timeout:     15 * time.Second,
+		})
+		if sshErr != nil {
+			_ = w.queue.AppendLog(ctx, job.DeploymentID, "stderr", "failed to initialize ssh driver: "+sshErr.Error())
+			return w.markFailedWithAI(ctx, job, "Failed to initialize SSH driver.", sshErr.Error())
+		}
+		driver = sshDriver
+	}
+
 	containerName := fmt.Sprintf("orcastra-%s-%s", short(job.ServiceID), short(job.DeploymentID))
-	containerID, err := w.localDriver.RunContainer(ctx, hostdriver.ContainerSpec{
+	containerID, err := driver.RunContainer(ctx, hostdriver.ContainerSpec{
 		Name:  containerName,
 		Image: job.DockerImage,
 		Env:   envVars,

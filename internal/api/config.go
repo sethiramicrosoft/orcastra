@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -17,6 +18,8 @@ type Config struct {
 	JWTTTL      time.Duration
 
 	GitHubWebhookSecret string
+	EncryptionKeyB64    string
+	EncryptionKeyID     string
 }
 
 func LoadConfigFromEnv() (Config, error) {
@@ -29,6 +32,8 @@ func LoadConfigFromEnv() (Config, error) {
 		JWTTTL:      getenvDuration("JWT_TTL", 24*time.Hour),
 
 		GitHubWebhookSecret: os.Getenv("GITHUB_WEBHOOK_SECRET"),
+		EncryptionKeyB64:    strings.TrimSpace(os.Getenv("ENCRYPTION_KEY_B64")),
+		EncryptionKeyID:     getenv("ENCRYPTION_KEY_ID", "aesgcm-v1"),
 	}
 
 	if cfg.DatabaseURL == "" {

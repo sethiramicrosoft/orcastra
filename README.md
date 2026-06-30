@@ -29,6 +29,9 @@ cp .env.example .env
 docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
+`ENCRYPTION_KEY_B64` is recommended for stable encryption keys across restarts.
+If omitted, Orcastra derives a key from `JWT_SECRET` for local/dev compatibility.
+
 Then open:
 
 - `http://localhost:3000/` (frontend)
@@ -71,6 +74,7 @@ Bring your own LLM: OpenAI, Anthropic, Gemini, OpenRouter (200+ models), Groq, M
 - [ ] Git webhook auto-deploy (GitHub, GitLab, Bitbucket)
 - [x] Real-time deploy logs (SSE, structured + stored for AI)
 - [x] Service secret management (versioned env vars per service)
+- [x] AES-GCM encryption at rest for service secrets and AI provider API keys
 - [ ] Resource monitoring (CPU, RAM, disk)
 - [x] Multi-user auth (teams, roles, audit log)
 - [x] **AI deploy failure analysis** — diagnosis + suggested fix on every failure
