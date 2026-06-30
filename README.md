@@ -29,7 +29,10 @@ cp .env.example .env
 docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
-Then open `http://localhost:3000/healthz`.
+Then open:
+
+- `http://localhost:3000/` (frontend)
+- `http://localhost:3000/healthz` (API health)
 
 ## Frontend (fun colorful UI shell)
 
@@ -66,12 +69,31 @@ Bring your own LLM: OpenAI, Anthropic, Gemini, OpenRouter (200+ models), Groq, M
 - [ ] Docker container orchestration (apps, databases, workers)
 - [ ] Caddy reverse proxy with automatic Let's Encrypt SSL
 - [ ] Git webhook auto-deploy (GitHub, GitLab, Bitbucket)
-- [ ] Real-time deploy logs (SSE, structured + stored for AI)
+- [x] Real-time deploy logs (SSE, structured + stored for AI)
+- [x] Service secret management (versioned env vars per service)
 - [ ] Resource monitoring (CPU, RAM, disk)
-- [ ] Multi-user auth (teams, roles, audit log)
-- [ ] **AI deploy failure analysis** — diagnosis + suggested fix on every failure
+- [x] Multi-user auth (teams, roles, audit log)
+- [x] **AI deploy failure analysis** — diagnosis + suggested fix on every failure
 - [ ] **AI fix PR** — one click to open a pull request with the suggested change
 - [ ] **AI health monitoring** — plain-English alerts, not just graphs
+
+## API snippets
+
+Set a service secret (creates a new immutable version each time):
+
+```bash
+curl -X POST http://localhost:3000/api/v1/services/<service-id>/secrets \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"key":"DATABASE_URL","value":"postgres://..."}'
+```
+
+List current secret keys for a service:
+
+```bash
+curl http://localhost:3000/api/v1/services/<service-id>/secrets \
+  -H "Authorization: Bearer <token>"
+```
 
 ## Architecture principles
 

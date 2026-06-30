@@ -264,6 +264,38 @@ select option {
   color: #d7ddff;
 }
 
+.secret-list {
+  margin-top: 0.9rem;
+}
+
+.secret-list label {
+  display: block;
+  margin-bottom: 0.35rem;
+  color: #d7ddff;
+}
+
+.secret-list ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 0.4rem;
+}
+
+.secret-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.07);
+  border-radius: 10px;
+  padding: 0.45rem 0.6rem;
+}
+
+.secret-list small {
+  color: #b3c7ff;
+}
+
 .error {
   color: #ff8ba2;
   margin-top: 0.65rem;

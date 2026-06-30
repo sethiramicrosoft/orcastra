@@ -52,6 +52,8 @@ func (s *Server) Routes() http.Handler {
 	r.With(s.requireAuth).Get("/api/v1/deployments/recent", s.handleRecentDeployments)
 	r.With(s.requireAuth).Get("/api/v1/deployments/{deploymentID}/stream", s.handleDeploymentStream)
 	r.With(s.requireAuth).Get("/api/v1/services", s.handleListServices)
+	r.With(s.requireAuth).Get("/api/v1/services/{serviceID}/secrets", s.handleListServiceSecrets)
+	r.With(s.requireAuth).Post("/api/v1/services/{serviceID}/secrets", s.handleUpsertServiceSecret)
 	r.With(s.requireAuth).Post("/api/v1/servers/localhost", s.handleEnsureLocalhostServer)
 	r.With(s.requireAuth).Post("/api/v1/projects", s.handleCreateProject)
 	r.With(s.requireAuth).Post("/api/v1/services", s.handleCreateService)
@@ -75,6 +77,8 @@ func (s *Server) RoutesWithUI(uiHandler http.Handler) http.Handler {
 	r.With(s.requireAuth).Get("/api/v1/deployments/recent", s.handleRecentDeployments)
 	r.With(s.requireAuth).Get("/api/v1/deployments/{deploymentID}/stream", s.handleDeploymentStream)
 	r.With(s.requireAuth).Get("/api/v1/services", s.handleListServices)
+	r.With(s.requireAuth).Get("/api/v1/services/{serviceID}/secrets", s.handleListServiceSecrets)
+	r.With(s.requireAuth).Post("/api/v1/services/{serviceID}/secrets", s.handleUpsertServiceSecret)
 	r.With(s.requireAuth).Post("/api/v1/servers/localhost", s.handleEnsureLocalhostServer)
 	r.With(s.requireAuth).Post("/api/v1/projects", s.handleCreateProject)
 	r.With(s.requireAuth).Post("/api/v1/services", s.handleCreateService)
@@ -807,6 +811,151 @@ func (s *Server) handleListServices(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": services})
+}
+
+func (s *Server) handleListServiceSecrets(w http.ResponseWriter, r *http.Request) {
+	claims, ok := getClaims(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "missing auth claims")
+		return
+	}
+	serviceID := chi.URLParam(r, "serviceID")
+	if strings.TrimSpace(serviceID) == "" {
+		writeError(w, http.StatusBadRequest, "serviceID is required")
+		return
+	}
+
+	var serviceExists bool
+	err := s.db.QueryRow(r.Context(), `
+		SELECT EXISTS(
+			SELECT 1 FROM services
+			WHERE id = $1::uuid AND team_id = $2::uuid AND deleted_at IS NULL
+		)
+	`, serviceID, claims.TeamID).Scan(&serviceExists)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to validate service")
+		return
+	}
+	if !serviceExists {
+		writeError(w, http.StatusNotFound, "service not found")
+		return
+	}
+
+	type secretItem struct {
+		Key       string `json:"key"`
+		Version   int    `json:"version"`
+		CreatedAt string `json:"createdAt"`
+	}
+
+	rows, err := s.db.Query(r.Context(), `
+		SELECT DISTINCT ON (sec.key)
+			sec.key,
+			sec.version,
+			sec.created_at
+		FROM secrets sec
+		WHERE sec.service_id = $1::uuid
+		  AND sec.team_id = $2::uuid
+		ORDER BY sec.key, sec.version DESC
+	`, serviceID, claims.TeamID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list service secrets")
+		return
+	}
+	defer rows.Close()
+
+	items := make([]secretItem, 0)
+	for rows.Next() {
+		var item secretItem
+		var createdAt time.Time
+		if scanErr := rows.Scan(&item.Key, &item.Version, &createdAt); scanErr != nil {
+			writeError(w, http.StatusInternalServerError, "failed to parse service secrets")
+			return
+		}
+		item.CreatedAt = createdAt.UTC().Format(time.RFC3339)
+		items = append(items, item)
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		writeError(w, http.StatusInternalServerError, "failed to iterate service secrets")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) handleUpsertServiceSecret(w http.ResponseWriter, r *http.Request) {
+	claims, ok := getClaims(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "missing auth claims")
+		return
+	}
+	serviceID := chi.URLParam(r, "serviceID")
+	if strings.TrimSpace(serviceID) == "" {
+		writeError(w, http.StatusBadRequest, "serviceID is required")
+		return
+	}
+
+	var req struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	req.Key = strings.TrimSpace(req.Key)
+	if req.Key == "" || req.Value == "" {
+		writeError(w, http.StatusBadRequest, "key and value are required")
+		return
+	}
+
+	var serviceExists bool
+	err := s.db.QueryRow(r.Context(), `
+		SELECT EXISTS(
+			SELECT 1 FROM services
+			WHERE id = $1::uuid AND team_id = $2::uuid AND deleted_at IS NULL
+		)
+	`, serviceID, claims.TeamID).Scan(&serviceExists)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to validate service")
+		return
+	}
+	if !serviceExists {
+		writeError(w, http.StatusNotFound, "service not found")
+		return
+	}
+
+	var version int
+	err = s.db.QueryRow(r.Context(), `
+		SELECT COALESCE(MAX(version), 0) + 1
+		FROM secrets
+		WHERE service_id = $1::uuid
+		  AND team_id = $2::uuid
+		  AND key = $3
+	`, serviceID, claims.TeamID, req.Key).Scan(&version)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to compute secret version")
+		return
+	}
+
+	secretID := uuid.NewString()
+	_, err = s.db.Exec(r.Context(), `
+		INSERT INTO secrets (id, service_id, team_id, key, value_ct, value_kid, version)
+		VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, 'plain-v1', $6)
+	`, secretID, serviceID, claims.TeamID, req.Key, []byte(req.Value), version)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to store service secret")
+		return
+	}
+
+	_, _ = s.db.Exec(r.Context(), `
+		INSERT INTO audit_events (actor_id, action, resource_type, resource_id, team_id, meta)
+		VALUES ($1::uuid, 'secret.upsert', 'service', $2::uuid, $3::uuid, jsonb_build_object('key', $4::text, 'version', $5))
+	`, claims.UserID, serviceID, claims.TeamID, req.Key, version)
+
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"key":     req.Key,
+		"version": version,
+	})
 }
 
 func (s *Server) handleEnsureLocalhostServer(w http.ResponseWriter, r *http.Request) {

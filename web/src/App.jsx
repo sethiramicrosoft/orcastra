@@ -55,6 +55,8 @@ export default function App() {
   const [services, setServices] = useState([]);
   const [serviceForm, setServiceForm] = useState({ name: '', dockerImage: '', gitRepoUrl: '', gitBranch: 'main' });
   const [selectedServiceID, setSelectedServiceID] = useState('');
+  const [secrets, setSecrets] = useState([]);
+  const [secretForm, setSecretForm] = useState({ key: '', value: '' });
   const [watchDeployID, setWatchDeployID] = useState('');
   const [deploying, setDeploying] = useState(false);
   const [aiConfig, setAIConfig] = useState({ providerType: 'openai_compat', displayName: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1', model: 'openai/gpt-4o-mini', apiKey: '' });
@@ -84,6 +86,14 @@ export default function App() {
     return () => clearInterval(interval);
   }, [token]);
 
+  useEffect(() => {
+    if (!token || !selectedServiceID) {
+      setSecrets([]);
+      return;
+    }
+    refreshSecrets(selectedServiceID);
+  }, [token, selectedServiceID]);
+
   async function refresh() {
     try {
       const [dash, recent, svc] = await Promise.all([
@@ -95,6 +105,16 @@ export default function App() {
       setDeployments(recent.items || []);
       setServices(svc.items || []);
       if (!selectedServiceID && (svc.items || []).length > 0) setSelectedServiceID(svc.items[0].id);
+    } catch (e) {
+      setError(e.message);
+    }
+  }
+
+  async function refreshSecrets(serviceID) {
+    if (!serviceID) return;
+    try {
+      const sec = await api(`/api/v1/services/${serviceID}/secrets`, { token });
+      setSecrets(sec.items || []);
     } catch (e) {
       setError(e.message);
     }
@@ -184,6 +204,31 @@ export default function App() {
       setInfo('AI provider saved.');
     } catch (e) {
       setError(e.message);
+    }
+
+    async function saveSecret() {
+      if (!selectedServiceID) {
+        setError('Select a service before adding secrets.');
+        return;
+      }
+      if (!secretForm.key || !secretForm.value) {
+        setError('Secret key and value are required.');
+        return;
+      }
+      setError('');
+      setInfo('');
+      try {
+        await api(`/api/v1/services/${selectedServiceID}/secrets`, {
+          method: 'POST',
+          token,
+          body: { key: secretForm.key, value: secretForm.value }
+        });
+        setSecretForm({ key: '', value: '' });
+        await refreshSecrets(selectedServiceID);
+        setInfo('Secret saved.');
+      } catch (e) {
+        setError(e.message);
+      }
     }
   }
 
@@ -338,6 +383,32 @@ export default function App() {
               <option key={s.id} value={s.id}>{s.name} ({s.dockerImage})</option>
             ))}
           </select>
+        </div>
+        <div className="mini-form" style={{ marginTop: '1rem' }}>
+          <input
+            placeholder="Secret key (e.g. DATABASE_URL)"
+            value={secretForm.key}
+            onChange={(e) => setSecretForm({ ...secretForm, key: e.target.value })}
+          />
+          <input
+            placeholder="Secret value"
+            type="password"
+            value={secretForm.value}
+            onChange={(e) => setSecretForm({ ...secretForm, value: e.target.value })}
+          />
+          <button className="ghost" onClick={saveSecret}>Save secret</button>
+        </div>
+        <div className="secret-list">
+          <label>Current secret keys</label>
+          <ul>
+            {secrets.map((s) => (
+              <li key={s.key}>
+                <span>{s.key}</span>
+                <small>v{s.version}</small>
+              </li>
+            ))}
+            {secrets.length === 0 && <li><span>No secrets yet</span></li>}
+          </ul>
         </div>
       </section>
     </div>

@@ -65,11 +65,22 @@ func (w *Worker) processOnce(ctx context.Context) error {
 		_ = w.queue.AppendLog(ctx, job.DeploymentID, "stderr", "service has no docker_image")
 		return w.markFailedWithAI(ctx, job, "Service is missing docker_image.", "Set docker_image on the service before deploying.")
 	}
+	if w.localDriver == nil {
+		_ = w.queue.AppendLog(ctx, job.DeploymentID, "stderr", "local driver unavailable")
+		return w.markFailedWithAI(ctx, job, "Local host driver is unavailable.", "Restart Orcastra and confirm Docker socket access.")
+	}
+
+	envVars, envErr := w.queue.BuildServiceEnv(ctx, job.ServiceID, job.TeamID)
+	if envErr != nil {
+		_ = w.queue.AppendLog(ctx, job.DeploymentID, "stderr", "failed to load service secrets: "+envErr.Error())
+		return w.markFailedWithAI(ctx, job, "Failed to load service secrets.", envErr.Error())
+	}
 
 	containerName := fmt.Sprintf("orcastra-%s-%s", short(job.ServiceID), short(job.DeploymentID))
 	containerID, err := w.localDriver.RunContainer(ctx, hostdriver.ContainerSpec{
 		Name:  containerName,
 		Image: job.DockerImage,
+		Env:   envVars,
 		Labels: map[string]string{
 			"orcastra.service_id":    job.ServiceID,
 			"orcastra.deployment_id": job.DeploymentID,

@@ -59,6 +59,13 @@ type AIProviderConfig struct {
 	Enabled      bool
 }
 
+type ServiceSecret struct {
+	Key       string
+	Value     string
+	Version   int
+	CreatedAt time.Time
+}
+
 func (q *Queue) Enqueue(ctx context.Context, in EnqueueInput) (*Deployment, error) {
 	if in.ServiceID == "" || in.TeamID == "" || in.TriggerType == "" {
 		return nil, fmt.Errorf("serviceID, teamID and triggerType are required")
@@ -226,4 +233,47 @@ func (q *Queue) GetAIProviderConfig(ctx context.Context, teamID string) (*AIProv
 		cfg.APIKey = string(apiKeyCT)
 	}
 	return &cfg, nil
+}
+
+func (q *Queue) GetLatestServiceSecrets(ctx context.Context, serviceID, teamID string) ([]ServiceSecret, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT DISTINCT ON (s.key)
+			s.key,
+			COALESCE(convert_from(s.value_ct, 'UTF8'), ''),
+			s.version,
+			s.created_at
+		FROM secrets s
+		WHERE s.service_id = $1::uuid
+		  AND s.team_id = $2::uuid
+		ORDER BY s.key, s.version DESC
+	`, serviceID, teamID)
+	if err != nil {
+		return nil, fmt.Errorf("load latest service secrets: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]ServiceSecret, 0)
+	for rows.Next() {
+		var item ServiceSecret
+		if scanErr := rows.Scan(&item.Key, &item.Value, &item.Version, &item.CreatedAt); scanErr != nil {
+			return nil, fmt.Errorf("scan service secret: %w", scanErr)
+		}
+		out = append(out, item)
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		return nil, fmt.Errorf("iterate service secrets: %w", rowsErr)
+	}
+	return out, nil
+}
+
+func (q *Queue) BuildServiceEnv(ctx context.Context, serviceID, teamID string) (map[string]string, error) {
+	items, err := q.GetLatestServiceSecrets(ctx, serviceID, teamID)
+	if err != nil {
+		return nil, err
+	}
+	env := make(map[string]string, len(items))
+	for _, item := range items {
+		env[item.Key] = item.Value
+	}
+	return env, nil
 }
