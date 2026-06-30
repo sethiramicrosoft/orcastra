@@ -42,10 +42,21 @@ type Job struct {
 	DeploymentID string
 	ServiceID    string
 	TeamID       string
+	ServiceName  string
+	TriggerType  string
+	CommitSHA    string
 	DockerImage  string
 	GitRepoURL   string
 	GitBranch    string
 	IsLocalhost  bool
+}
+
+type AIProviderConfig struct {
+	ProviderType string
+	BaseURL      string
+	Model        string
+	APIKey       string
+	Enabled      bool
 }
 
 func (q *Queue) Enqueue(ctx context.Context, in EnqueueInput) (*Deployment, error) {
@@ -92,6 +103,9 @@ func (q *Queue) ClaimNext(ctx context.Context) (*Job, error) {
 	err = tx.QueryRow(ctx, `
 		WITH next_job AS (
 			SELECT d.id, d.service_id, d.team_id,
+			       COALESCE(s.name, '') AS service_name,
+			       d.trigger_type,
+			       COALESCE(d.commit_sha, '') AS commit_sha,
 			       COALESCE(s.docker_image, '') AS docker_image,
 			       COALESCE(s.git_repo_url, '') AS git_repo_url,
 			       COALESCE(s.git_branch, 'main') AS git_branch,
@@ -109,11 +123,14 @@ func (q *Queue) ClaimNext(ctx context.Context) (*Job, error) {
 		SET status = 'building', started_at = now()
 		FROM next_job
 		WHERE d.id = next_job.id
-		RETURNING next_job.id, next_job.service_id, next_job.team_id, next_job.docker_image, next_job.git_repo_url, next_job.git_branch, next_job.is_localhost
+		RETURNING next_job.id, next_job.service_id, next_job.team_id, next_job.service_name, next_job.trigger_type, next_job.commit_sha, next_job.docker_image, next_job.git_repo_url, next_job.git_branch, next_job.is_localhost
 	`).Scan(
 		&job.DeploymentID,
 		&job.ServiceID,
 		&job.TeamID,
+		&job.ServiceName,
+		&job.TriggerType,
+		&job.CommitSHA,
 		&job.DockerImage,
 		&job.GitRepoURL,
 		&job.GitBranch,
@@ -182,4 +199,31 @@ func nullable(v string) any {
 		return nil
 	}
 	return v
+}
+
+func (q *Queue) GetAIProviderConfig(ctx context.Context, teamID string) (*AIProviderConfig, error) {
+	var (
+		cfg      AIProviderConfig
+		baseURL  *string
+		apiKeyCT []byte
+	)
+	err := q.db.QueryRow(ctx, `
+		SELECT provider_type, base_url, model, api_key_ct, is_enabled
+		FROM ai_provider_configs
+		WHERE team_id = $1
+		LIMIT 1
+	`, teamID).Scan(&cfg.ProviderType, &baseURL, &cfg.Model, &apiKeyCT, &cfg.Enabled)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("load ai provider config: %w", err)
+	}
+	if baseURL != nil {
+		cfg.BaseURL = *baseURL
+	}
+	if len(apiKeyCT) > 0 {
+		cfg.APIKey = string(apiKeyCT)
+	}
+	return &cfg, nil
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/sethiramicrosoft/orcastra/internal/ai"
 	"github.com/sethiramicrosoft/orcastra/internal/hostdriver"
 	"github.com/sethiramicrosoft/orcastra/internal/hostdriver/local"
 )
@@ -53,12 +54,12 @@ func (w *Worker) processOnce(ctx context.Context) error {
 
 	if !job.IsLocalhost {
 		_ = w.queue.AppendLog(ctx, job.DeploymentID, "stderr", "remote deployment path not wired yet")
-		return w.queue.MarkFailed(ctx, job.DeploymentID, "Remote deployment is not yet enabled for this build.", "Use localhost server for now, or wait for SSH executor wiring.")
+		return w.markFailedWithAI(ctx, job, "Remote deployment is not yet enabled for this build.", "Use localhost server for now, or wait for SSH executor wiring.")
 	}
 
 	if job.DockerImage == "" {
 		_ = w.queue.AppendLog(ctx, job.DeploymentID, "stderr", "service has no docker_image")
-		return w.queue.MarkFailed(ctx, job.DeploymentID, "Service is missing docker_image.", "Set docker_image on the service before deploying.")
+		return w.markFailedWithAI(ctx, job, "Service is missing docker_image.", "Set docker_image on the service before deploying.")
 	}
 
 	containerName := fmt.Sprintf("orcastra-%s-%s", short(job.ServiceID), short(job.DeploymentID))
@@ -72,11 +73,42 @@ func (w *Worker) processOnce(ctx context.Context) error {
 	})
 	if err != nil {
 		_ = w.queue.AppendLog(ctx, job.DeploymentID, "stderr", err.Error())
-		return w.queue.MarkFailed(ctx, job.DeploymentID, "Docker run failed for this image.", err.Error())
+		return w.markFailedWithAI(ctx, job, "Docker run failed for this image.", err.Error())
 	}
 
 	_ = w.queue.AppendLog(ctx, job.DeploymentID, "stdout", "container started: "+containerID)
 	return w.queue.MarkRunning(ctx, job.DeploymentID)
+}
+
+func (w *Worker) markFailedWithAI(ctx context.Context, job *Job, fallbackDiagnosis, failureLine string) error {
+	diagnosis := fallbackDiagnosis
+	suggestion := failureLine
+
+	cfg, err := w.queue.GetAIProviderConfig(ctx, job.TeamID)
+	if err == nil && cfg != nil && cfg.Enabled {
+		provider, pErr := ai.NewProvider(ai.Config{
+			Type:    ai.ProviderType(cfg.ProviderType),
+			BaseURL: cfg.BaseURL,
+			APIKey:  cfg.APIKey,
+			Model:   cfg.Model,
+		})
+		if pErr == nil {
+			result, aErr := provider.Analyze(ctx, ai.AnalysisRequest{
+				LogLines:    []string{failureLine},
+				ServiceName: job.ServiceName,
+				TriggerType: job.TriggerType,
+				CommitSHA:   job.CommitSHA,
+			})
+			if aErr == nil && result != nil && result.Diagnosis != "" {
+				diagnosis = result.Diagnosis
+				if result.Suggestion != "" {
+					suggestion = result.Suggestion
+				}
+			}
+		}
+	}
+
+	return w.queue.MarkFailed(ctx, job.DeploymentID, diagnosis, suggestion)
 }
 
 func short(v string) string {

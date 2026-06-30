@@ -47,6 +47,14 @@ func (s *Server) Routes() http.Handler {
 	r.Post("/api/v1/auth/register", s.handleRegister)
 	r.Post("/api/v1/auth/login", s.handleLogin)
 	r.With(s.requireAuth).Get("/api/v1/auth/me", s.handleMe)
+	r.With(s.requireAuth).Get("/api/v1/dashboard", s.handleDashboard)
+	r.With(s.requireAuth).Get("/api/v1/deployments/recent", s.handleRecentDeployments)
+	r.With(s.requireAuth).Get("/api/v1/deployments/{deploymentID}/stream", s.handleDeploymentStream)
+	r.With(s.requireAuth).Get("/api/v1/services", s.handleListServices)
+	r.With(s.requireAuth).Post("/api/v1/servers/localhost", s.handleEnsureLocalhostServer)
+	r.With(s.requireAuth).Post("/api/v1/projects", s.handleCreateProject)
+	r.With(s.requireAuth).Post("/api/v1/services", s.handleCreateService)
+	r.With(s.requireAuth).Post("/api/v1/ai/provider", s.handleUpsertAIProvider)
 
 	r.With(s.requireAuth).Post("/api/v1/services/{serviceID}/deploy", s.handleManualDeploy)
 	r.Post("/api/v1/webhooks/github", s.handleGitHubWebhook)
@@ -521,6 +529,451 @@ func (s *Server) emailExists(ctx context.Context, email string) (bool, error) {
 		return false, err
 	}
 	return exists, nil
+}
+
+func getClaims(r *http.Request) (*auth.Claims, bool) {
+	claims, ok := r.Context().Value(claimsContextKey).(*auth.Claims)
+	if !ok || claims == nil {
+		return nil, false
+	}
+	return claims, true
+}
+
+func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
+	claims, ok := getClaims(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "missing auth claims")
+		return
+	}
+
+	var deploymentsToday int
+	var queueWaiting int
+	var failed int
+	var services int
+	err := s.db.QueryRow(r.Context(), `
+		SELECT
+		  COUNT(*) FILTER (WHERE created_at::date = CURRENT_DATE) AS deployments_today,
+		  COUNT(*) FILTER (WHERE status IN ('queued', 'building', 'deploying')) AS queue_waiting,
+		  COUNT(*) FILTER (WHERE status = 'failed') AS failed_count
+		FROM deployments
+		WHERE team_id = $1
+	`, claims.TeamID).Scan(&deploymentsToday, &queueWaiting, &failed)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load dashboard metrics")
+		return
+	}
+	err = s.db.QueryRow(r.Context(), `
+		SELECT COUNT(*) FROM services WHERE team_id = $1 AND deleted_at IS NULL
+	`, claims.TeamID).Scan(&services)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load services count")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"deploymentsToday": deploymentsToday,
+		"queueWaiting":     queueWaiting,
+		"failedBuilds":     failed,
+		"services":         services,
+	})
+}
+
+func (s *Server) handleRecentDeployments(w http.ResponseWriter, r *http.Request) {
+	claims, ok := getClaims(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "missing auth claims")
+		return
+	}
+	rows, err := s.db.Query(r.Context(), `
+		SELECT d.id, d.status, COALESCE(d.ai_diagnosis, ''), COALESCE(d.ai_suggestion, ''), d.created_at,
+		       COALESCE(d.commit_sha, ''), COALESCE(s.name, '')
+		FROM deployments d
+		JOIN services s ON s.id = d.service_id
+		WHERE d.team_id = $1
+		ORDER BY d.created_at DESC
+		LIMIT 25
+	`, claims.TeamID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load deployments")
+		return
+	}
+	defer rows.Close()
+
+	type deploymentRow struct {
+		ID          string    `json:"id"`
+		Status      string    `json:"status"`
+		Diagnosis   string    `json:"diagnosis,omitempty"`
+		Suggestion  string    `json:"suggestion,omitempty"`
+		CreatedAt   time.Time `json:"createdAt"`
+		CommitSHA   string    `json:"commitSha,omitempty"`
+		ServiceName string    `json:"serviceName"`
+	}
+
+	items := make([]deploymentRow, 0, 25)
+	for rows.Next() {
+		var item deploymentRow
+		if err := rows.Scan(&item.ID, &item.Status, &item.Diagnosis, &item.Suggestion, &item.CreatedAt, &item.CommitSHA, &item.ServiceName); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to parse deployments")
+			return
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to iterate deployments")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) handleDeploymentStream(w http.ResponseWriter, r *http.Request) {
+	claims, ok := getClaims(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "missing auth claims")
+		return
+	}
+	deploymentID := chi.URLParam(r, "deploymentID")
+	if deploymentID == "" {
+		writeError(w, http.StatusBadRequest, "deploymentID is required")
+		return
+	}
+
+	var allowed bool
+	err := s.db.QueryRow(r.Context(), `
+		SELECT EXISTS(
+			SELECT 1 FROM deployments WHERE id = $1 AND team_id = $2
+		)
+	`, deploymentID, claims.TeamID).Scan(&allowed)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to validate deployment access")
+		return
+	}
+	if !allowed {
+		writeError(w, http.StatusForbidden, "deployment not found")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "streaming unsupported")
+		return
+	}
+
+	ctx := r.Context()
+	lastID := int64(0)
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			rows, err := s.db.Query(ctx, `
+				SELECT id, stream, line, ts
+				FROM deployment_logs
+				WHERE deployment_id = $1 AND id > $2
+				ORDER BY id ASC
+			`, deploymentID, lastID)
+			if err != nil {
+				fmt.Fprintf(w, "event: error\ndata: %s\n\n", marshalJSON(map[string]string{"error": "failed to read logs"}))
+				flusher.Flush()
+				return
+			}
+
+			for rows.Next() {
+				var id int64
+				var stream, line string
+				var ts time.Time
+				if err := rows.Scan(&id, &stream, &line, &ts); err != nil {
+					rows.Close()
+					return
+				}
+				lastID = id
+				payload := map[string]any{
+					"id":     id,
+					"stream": stream,
+					"line":   line,
+					"ts":     ts.UTC().Format(time.RFC3339),
+				}
+				fmt.Fprintf(w, "event: log\ndata: %s\n\n", marshalJSON(payload))
+				flusher.Flush()
+			}
+			rows.Close()
+		}
+	}
+}
+
+func (s *Server) handleListServices(w http.ResponseWriter, r *http.Request) {
+	claims, ok := getClaims(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "missing auth claims")
+		return
+	}
+
+	rows, err := s.db.Query(r.Context(), `
+		SELECT s.id, s.name, COALESCE(s.type::text, 'app'), COALESCE(s.docker_image, ''), COALESCE(s.git_repo_url, ''), COALESCE(s.git_branch, 'main')
+		FROM services s
+		WHERE s.team_id = $1 AND s.deleted_at IS NULL
+		ORDER BY s.created_at DESC
+	`, claims.TeamID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list services")
+		return
+	}
+	defer rows.Close()
+
+	type serviceItem struct {
+		ID          string `json:"id"`
+		Name        string `json:"name"`
+		Type        string `json:"type"`
+		DockerImage string `json:"dockerImage"`
+		GitRepoURL  string `json:"gitRepoUrl,omitempty"`
+		GitBranch   string `json:"gitBranch,omitempty"`
+	}
+
+	services := make([]serviceItem, 0)
+	for rows.Next() {
+		var item serviceItem
+		if err := rows.Scan(&item.ID, &item.Name, &item.Type, &item.DockerImage, &item.GitRepoURL, &item.GitBranch); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to parse services")
+			return
+		}
+		services = append(services, item)
+	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to iterate services")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": services})
+}
+
+func (s *Server) handleEnsureLocalhostServer(w http.ResponseWriter, r *http.Request) {
+	claims, ok := getClaims(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "missing auth claims")
+		return
+	}
+	ctx := r.Context()
+	var existingID string
+	err := s.db.QueryRow(ctx, `
+		SELECT id FROM servers
+		WHERE team_id = $1 AND is_localhost = true AND deleted_at IS NULL
+		ORDER BY created_at ASC
+		LIMIT 1
+	`, claims.TeamID).Scan(&existingID)
+	if err == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"id": existingID, "created": false})
+		return
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusInternalServerError, "failed to check localhost server")
+		return
+	}
+
+	id := uuid.NewString()
+	_, err = s.db.Exec(ctx, `
+		INSERT INTO servers (id, team_id, name, host, port, ssh_user, ssh_key_ct, ssh_key_kid, status, is_localhost, docker_version)
+		VALUES ($1, $2, 'localhost', '127.0.0.1', 22, 'local', $3, 'localhost', 'reachable', true, 'local-docker')
+	`, id, claims.TeamID, []byte("localhost"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create localhost server")
+		return
+	}
+	_, _ = s.db.Exec(ctx, `
+		INSERT INTO audit_events (actor_id, action, resource_type, resource_id, team_id)
+		VALUES ($1, 'server.localhost.create', 'server', $2, $3)
+	`, claims.UserID, id, claims.TeamID)
+	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "created": true})
+}
+
+func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
+	claims, ok := getClaims(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "missing auth claims")
+		return
+	}
+	var req struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		ServerID    string `json:"serverId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if strings.TrimSpace(req.Name) == "" || strings.TrimSpace(req.ServerID) == "" {
+		writeError(w, http.StatusBadRequest, "name and serverId are required")
+		return
+	}
+
+	var serverExists bool
+	err := s.db.QueryRow(r.Context(), `
+		SELECT EXISTS(SELECT 1 FROM servers WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL)
+	`, req.ServerID, claims.TeamID).Scan(&serverExists)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to validate server")
+		return
+	}
+	if !serverExists {
+		writeError(w, http.StatusNotFound, "server not found")
+		return
+	}
+
+	projectID := uuid.NewString()
+	_, err = s.db.Exec(r.Context(), `
+		INSERT INTO projects (id, team_id, server_id, name, description)
+		VALUES ($1, $2, $3, $4, $5)
+	`, projectID, claims.TeamID, req.ServerID, strings.TrimSpace(req.Name), nullableString(req.Description))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create project")
+		return
+	}
+	_, _ = s.db.Exec(r.Context(), `
+		INSERT INTO audit_events (actor_id, action, resource_type, resource_id, team_id)
+		VALUES ($1, 'project.create', 'project', $2, $3)
+	`, claims.UserID, projectID, claims.TeamID)
+	writeJSON(w, http.StatusCreated, map[string]any{"id": projectID})
+}
+
+func (s *Server) handleCreateService(w http.ResponseWriter, r *http.Request) {
+	claims, ok := getClaims(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "missing auth claims")
+		return
+	}
+	var req struct {
+		ProjectID   string `json:"projectId"`
+		Name        string `json:"name"`
+		Type        string `json:"type"`
+		DockerImage string `json:"dockerImage"`
+		GitRepoURL  string `json:"gitRepoUrl"`
+		GitBranch   string `json:"gitBranch"`
+		Port        *int   `json:"port"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if strings.TrimSpace(req.ProjectID) == "" || strings.TrimSpace(req.Name) == "" || strings.TrimSpace(req.DockerImage) == "" {
+		writeError(w, http.StatusBadRequest, "projectId, name and dockerImage are required")
+		return
+	}
+
+	var projectExists bool
+	err := s.db.QueryRow(r.Context(), `
+		SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL)
+	`, req.ProjectID, claims.TeamID).Scan(&projectExists)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to validate project")
+		return
+	}
+	if !projectExists {
+		writeError(w, http.StatusNotFound, "project not found")
+		return
+	}
+
+	serviceID := uuid.NewString()
+	serviceType := strings.TrimSpace(req.Type)
+	if serviceType == "" {
+		serviceType = "app"
+	}
+	gitBranch := strings.TrimSpace(req.GitBranch)
+	if gitBranch == "" {
+		gitBranch = "main"
+	}
+	_, err = s.db.Exec(r.Context(), `
+		INSERT INTO services (id, project_id, team_id, name, type, docker_image, git_repo_url, git_branch, port)
+		VALUES ($1, $2, $3, $4, $5::service_type, $6, $7, $8, $9)
+	`, serviceID, req.ProjectID, claims.TeamID, strings.TrimSpace(req.Name), serviceType, strings.TrimSpace(req.DockerImage), nullableString(req.GitRepoURL), gitBranch, req.Port)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create service")
+		return
+	}
+	_, _ = s.db.Exec(r.Context(), `
+		INSERT INTO audit_events (actor_id, action, resource_type, resource_id, team_id)
+		VALUES ($1, 'service.create', 'service', $2, $3)
+	`, claims.UserID, serviceID, claims.TeamID)
+	writeJSON(w, http.StatusCreated, map[string]any{"id": serviceID})
+}
+
+func (s *Server) handleUpsertAIProvider(w http.ResponseWriter, r *http.Request) {
+	claims, ok := getClaims(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "missing auth claims")
+		return
+	}
+	var req struct {
+		ProviderType string `json:"providerType"`
+		DisplayName  string `json:"displayName"`
+		BaseURL      string `json:"baseUrl"`
+		Model        string `json:"model"`
+		APIKey       string `json:"apiKey"`
+		Enabled      *bool  `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if strings.TrimSpace(req.ProviderType) == "" || strings.TrimSpace(req.Model) == "" {
+		writeError(w, http.StatusBadRequest, "providerType and model are required")
+		return
+	}
+	enabled := true
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+	id := uuid.NewString()
+	_, err := s.db.Exec(r.Context(), `
+		INSERT INTO ai_provider_configs (id, team_id, provider_type, display_name, base_url, model, api_key_ct, api_key_kid, is_enabled, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+		ON CONFLICT (team_id)
+		DO UPDATE SET provider_type = EXCLUDED.provider_type,
+		              display_name = EXCLUDED.display_name,
+		              base_url = EXCLUDED.base_url,
+		              model = EXCLUDED.model,
+		              api_key_ct = EXCLUDED.api_key_ct,
+		              api_key_kid = EXCLUDED.api_key_kid,
+		              is_enabled = EXCLUDED.is_enabled,
+		              updated_at = now()
+	`, id, claims.TeamID, strings.TrimSpace(req.ProviderType), nonEmptyOrFallback(strings.TrimSpace(req.DisplayName), strings.TrimSpace(req.ProviderType)), nullableString(req.BaseURL), strings.TrimSpace(req.Model), nullableBytes(strings.TrimSpace(req.APIKey)), keyIDOrNil(strings.TrimSpace(req.APIKey)), enabled)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to upsert AI provider config")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func nullableBytes(v string) any {
+	if strings.TrimSpace(v) == "" {
+		return nil
+	}
+	return []byte(strings.TrimSpace(v))
+}
+
+func nonEmptyOrFallback(v string, fallback string) string {
+	if strings.TrimSpace(v) == "" {
+		return fallback
+	}
+	return strings.TrimSpace(v)
+}
+
+func keyIDOrNil(apiKey string) any {
+	if strings.TrimSpace(apiKey) == "" {
+		return nil
+	}
+	return "plain-v1"
+}
+
+func marshalJSON(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return `{}`
+	}
+	return string(b)
 }
 
 func matchesRepo(candidates []string, serviceRepo string) bool {

@@ -41,6 +41,13 @@ npm run dev
 
 Open `http://localhost:5173`.
 
+If backend is not on localhost:3000:
+
+```bash
+cd web
+VITE_API_BASE=http://your-api-host:3000 npm run dev
+```
+
 ## Why Orcastra over Coolify / Dokploy?
 
 Those tools deploy your app. Orcastra deploys your app **and understands it**.
