@@ -22,6 +22,7 @@ type Config struct {
 	EncryptionKeyB64    string
 	EncryptionKeyID     string
 	CaddyAdminAPI       string
+	HealthCheckInterval time.Duration
 }
 
 func LoadConfigFromEnv() (Config, error) {
@@ -38,6 +39,7 @@ func LoadConfigFromEnv() (Config, error) {
 		EncryptionKeyB64:    strings.TrimSpace(os.Getenv("ENCRYPTION_KEY_B64")),
 		EncryptionKeyID:     getenv("ENCRYPTION_KEY_ID", "aesgcm-v1"),
 		CaddyAdminAPI:       strings.TrimSpace(os.Getenv("CADDY_ADMIN_API")),
+		HealthCheckInterval: getenvDuration("HEALTH_CHECK_INTERVAL", 30*time.Second),
 	}
 
 	if cfg.DatabaseURL == "" {

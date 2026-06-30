@@ -31,6 +31,7 @@ docker compose -f deploy/docker-compose.yml up -d --build
 
 `ENCRYPTION_KEY_B64` is recommended for stable encryption keys across restarts.
 If omitted, Orcastra derives a key from `JWT_SECRET` for local/dev compatibility.
+`HEALTH_CHECK_INTERVAL` controls background deployment health checks (default `30s`).
 
 Then open:
 
@@ -79,7 +80,7 @@ Bring your own LLM: OpenAI, Anthropic, Gemini, OpenRouter (200+ models), Groq, M
 - [x] Multi-user auth (teams, roles, audit log)
 - [x] **AI deploy failure analysis** — diagnosis + suggested fix on every failure
 - [x] **AI fix PR** — one click to open a draft pull request with generated fix context
-- [ ] **AI health monitoring** — plain-English alerts, not just graphs
+- [x] **AI health monitoring** — periodic running-container checks with alert/audit events
 
 `GITHUB_TOKEN` is required for fix PR creation. The token must have repository write permissions.
 

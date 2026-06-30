@@ -16,6 +16,7 @@ import (
 	"github.com/sethiramicrosoft/orcastra/internal/api"
 	"github.com/sethiramicrosoft/orcastra/internal/db"
 	"github.com/sethiramicrosoft/orcastra/internal/deployqueue"
+	"github.com/sethiramicrosoft/orcastra/internal/healthmonitor"
 	"github.com/sethiramicrosoft/orcastra/internal/secretcrypto"
 )
 
@@ -78,10 +79,23 @@ func main() {
 		}
 	}()
 
+	monitorCtx, monitorCancel := context.WithCancel(context.Background())
+	monitor, err := healthmonitor.New(pool, cfg.HealthCheckInterval)
+	if err != nil {
+		log.Warn().Err(err).Msg("health monitor disabled")
+	} else {
+		go func() {
+			if err := monitor.Start(monitorCtx); err != nil && err != context.Canceled {
+				log.Error().Err(err).Msg("health monitor stopped")
+			}
+		}()
+	}
+
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	<-shutdownCtx.Done()
 	workerCancel()
+	monitorCancel()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
